@@ -1,0 +1,12 @@
+# Development
+.env
+dist
+node_modules
+coverage
+npm-debug.log
+
+# System
+.DS_Store
+Thumbs.db
+
+
