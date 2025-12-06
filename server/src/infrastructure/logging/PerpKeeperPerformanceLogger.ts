@@ -76,6 +76,7 @@ interface FundingRateSnapshot {
   fundingRate: number; // Per period (e.g., per 8 hours)
   positionSize: number; // Position size in base asset
   positionValue: number; // Position value in USD
+  positionSide: 'LONG' | 'SHORT'; // Position side - needed to correctly calculate APY
   timestamp: Date;
 }
 
@@ -169,6 +170,13 @@ export class PerpKeeperPerformanceLogger {
     metrics.totalUnrealizedPnl = positions.reduce((sum, pos) => sum + pos.unrealizedPnl, 0);
     metrics.lastUpdateTime = new Date();
 
+    // Remove old snapshots for positions being updated on this exchange
+    // This prevents duplicate snapshots for the same symbol+exchange
+    const symbolsToUpdate = new Set(positions.map(p => p.symbol));
+    this.fundingSnapshots = this.fundingSnapshots.filter(
+      (s) => !(symbolsToUpdate.has(s.symbol) && s.exchange === exchange)
+    );
+
     // Create funding rate snapshots for APY estimation
     for (const position of positions) {
       const fundingRate = fundingRates.find(
@@ -176,20 +184,36 @@ export class PerpKeeperPerformanceLogger {
       );
       
       if (fundingRate) {
+        // Use the position's side field (OrderSide.LONG or OrderSide.SHORT)
+        // OrderSide is a string enum with values 'LONG' and 'SHORT'
+        const positionSide = position.side === 'LONG' ? 'LONG' : 'SHORT';
+        
         this.fundingSnapshots.push({
           symbol: position.symbol,
           exchange,
           fundingRate: fundingRate.fundingRate,
           positionSize: position.size,
           positionValue: position.getPositionValue(),
+          positionSide,
           timestamp: new Date(),
         });
       }
     }
 
-    // Keep only recent snapshots (last 24 hours)
+    // Keep only recent snapshots (last 24 hours) and deduplicate by symbol+exchange (keep latest)
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
     this.fundingSnapshots = this.fundingSnapshots.filter((s) => s.timestamp > oneDayAgo);
+    
+    // Deduplicate: keep only the latest snapshot for each symbol+exchange combination
+    const snapshotMap = new Map<string, FundingRateSnapshot>();
+    for (const snapshot of this.fundingSnapshots) {
+      const key = `${snapshot.symbol}:${snapshot.exchange}`;
+      const existing = snapshotMap.get(key);
+      if (!existing || snapshot.timestamp > existing.timestamp) {
+        snapshotMap.set(key, snapshot);
+      }
+    }
+    this.fundingSnapshots = Array.from(snapshotMap.values());
   }
 
   /**
@@ -236,29 +260,40 @@ export class PerpKeeperPerformanceLogger {
 
   /**
    * Calculate estimated APY based on current funding rates and positions
+   * Accounts for position side:
+   * - LONG positions: negative funding rate = we receive funding (positive return)
+   * - SHORT positions: positive funding rate = we receive funding (positive return)
    */
   calculateEstimatedAPY(): number {
     if (this.fundingSnapshots.length === 0) return 0;
 
-    // Calculate weighted average funding rate
+    // Calculate weighted average funding rate, accounting for position side
     let totalValue = 0;
-    let weightedFundingRate = 0;
+    let weightedFundingReturn = 0; // Renamed to reflect it's the return we receive
 
     for (const snapshot of this.fundingSnapshots) {
       const value = snapshot.positionValue;
       totalValue += value;
-      weightedFundingRate += snapshot.fundingRate * value;
+      
+      // For LONG positions: negative funding rate = we receive funding (positive return)
+      // For SHORT positions: positive funding rate = we receive funding (positive return)
+      // So we flip the sign for LONG positions to get the return we actually receive
+      const fundingReturn = snapshot.positionSide === 'LONG' 
+        ? -snapshot.fundingRate  // LONG: negative rate = positive return
+        : snapshot.fundingRate;   // SHORT: positive rate = positive return
+      
+      weightedFundingReturn += fundingReturn * value;
     }
 
     if (totalValue === 0) return 0;
 
-    const avgFundingRate = weightedFundingRate / totalValue;
+    const avgFundingReturn = weightedFundingReturn / totalValue;
 
     // Convert per-period rate to annualized APY
     // Assuming 8-hour funding periods (3 per day)
     const periodsPerDay = 3;
     const periodsPerYear = periodsPerDay * 365;
-    const dailyRate = avgFundingRate * periodsPerDay;
+    const dailyRate = avgFundingReturn * periodsPerDay;
     const annualizedAPY = dailyRate * 365 * 100; // Convert to percentage
 
     return annualizedAPY;

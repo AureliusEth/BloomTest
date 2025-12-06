@@ -196,19 +196,35 @@ export class PositionLossTracker {
   /**
    * Get remaining break-even hours for current position
    * Assumes position is unprofitable and calculates how many hours needed to break even
+   * Accounts for fees already earned while holding the position
    */
   getRemainingBreakEvenHours(
     position: PerpPosition,
     currentFundingRate: number, // Current funding rate (per period, typically hourly)
     positionValueUsd?: number, // Optional, will use position.getPositionValue() if not provided
-  ): number {
+  ): {
+    remainingBreakEvenHours: number;
+    feesEarnedSoFar: number;
+    hoursHeld: number;
+    remainingCost: number;
+  } {
     const valueUsd = positionValueUsd ?? position.getPositionValue();
     const key = `${position.symbol}_${position.exchangeType}`;
     const currentPos = this.currentPositions.get(key);
     
     if (!currentPos) {
-      return Infinity; // No tracked entry, can't calculate
+      return {
+        remainingBreakEvenHours: Infinity,
+        feesEarnedSoFar: 0,
+        hoursHeld: 0,
+        remainingCost: Infinity,
+      };
     }
+
+    // Calculate hours held
+    const now = new Date();
+    const hoursHeldMs = now.getTime() - currentPos.startTime.getTime();
+    const hoursHeld = hoursHeldMs / (1000 * 60 * 60);
 
     // Calculate hourly return based on funding rate
     // For LONG: negative funding rate = receive funding (positive return)
@@ -221,15 +237,109 @@ export class PositionLossTracker {
     }
 
     if (hourlyReturn <= 0) {
-      return Infinity; // Position is not earning, never breaks even
+      return {
+        remainingBreakEvenHours: Infinity,
+        feesEarnedSoFar: 0,
+        hoursHeld,
+        remainingCost: Infinity,
+      };
     }
 
-    // Remaining costs = entry cost (already incurred) + estimated exit cost
+    // Calculate fees earned so far
+    const feesEarnedSoFar = hoursHeld * hourlyReturn;
+
+    // Remaining costs = entry cost (already incurred) + estimated exit cost - fees earned so far
     // We estimate exit cost as same as entry cost (maker fees)
     const estimatedExitCost = currentPos.entry.entryCost;
-    const remainingCosts = currentPos.entry.entryCost + estimatedExitCost;
+    const totalCosts = currentPos.entry.entryCost + estimatedExitCost;
+    const remainingCost = totalCosts - feesEarnedSoFar;
 
-    return remainingCosts / hourlyReturn;
+    // If we've already earned more than costs, position is profitable
+    if (remainingCost <= 0) {
+      return {
+        remainingBreakEvenHours: 0, // Already profitable
+        feesEarnedSoFar,
+        hoursHeld,
+        remainingCost: 0,
+      };
+    }
+
+    const remainingBreakEvenHours = remainingCost / hourlyReturn;
+
+    return {
+      remainingBreakEvenHours,
+      feesEarnedSoFar,
+      hoursHeld,
+      remainingCost,
+    };
+  }
+
+  /**
+   * Calculate switching costs when closing current position and opening new one
+   * Returns breakdown of all costs including lost progress (fees already earned)
+   */
+  getSwitchingCosts(
+    position: PerpPosition,
+    currentFundingRate: number,
+    newEntryCosts: number,
+    newExitCosts: number,
+    positionValueUsd?: number,
+  ): {
+    exitCostCurrent: number;
+    entryCostNew: number;
+    lostProgress: number;
+    totalSwitchingCost: number;
+    feesEarnedSoFar: number;
+    hoursHeld: number;
+  } {
+    const valueUsd = positionValueUsd ?? position.getPositionValue();
+    const key = `${position.symbol}_${position.exchangeType}`;
+    const currentPos = this.currentPositions.get(key);
+    
+    if (!currentPos) {
+      // No tracked entry, assume no switching costs (shouldn't happen in practice)
+    return {
+      exitCostCurrent: 0,
+      entryCostNew: newEntryCosts,
+      lostProgress: 0,
+      totalSwitchingCost: newEntryCosts,
+      feesEarnedSoFar: 0,
+      hoursHeld: 0,
+    };
+    }
+
+    // Calculate hours held and fees earned
+    const now = new Date();
+    const hoursHeldMs = now.getTime() - currentPos.startTime.getTime();
+    const hoursHeld = hoursHeldMs / (1000 * 60 * 60);
+
+    // Calculate hourly return
+    let hourlyReturn: number;
+    if (position.side === 'LONG') {
+      hourlyReturn = -currentFundingRate * valueUsd;
+    } else {
+      hourlyReturn = currentFundingRate * valueUsd;
+    }
+
+    const feesEarnedSoFar = Math.max(0, hoursHeld * hourlyReturn);
+
+    // Exit cost on current position (estimate as same as entry cost)
+    const exitCostCurrent = currentPos.entry.entryCost;
+
+    // Lost progress = fees we've already earned that we lose when closing
+    const lostProgress = feesEarnedSoFar;
+
+    // Total switching cost = exit fees + entry fees + lost progress
+    const totalSwitchingCost = exitCostCurrent + newEntryCosts + lostProgress;
+
+    return {
+      exitCostCurrent,
+      entryCostNew: newEntryCosts,
+      lostProgress,
+      totalSwitchingCost,
+      feesEarnedSoFar,
+      hoursHeld,
+    };
   }
 
   /**

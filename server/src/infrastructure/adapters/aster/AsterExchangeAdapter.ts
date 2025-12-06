@@ -28,6 +28,10 @@ export class AsterExchangeAdapter implements IPerpExchangeAdapter {
   private readonly wallet: ethers.Wallet | null;
   private readonly apiKey: string | undefined;
   private readonly apiSecret: string | undefined;
+  private symbolPrecisionCache: Map<string, number> = new Map(); // Cache quantity precision per symbol
+  private symbolStepSizeCache: Map<string, number> = new Map(); // Cache stepSize per symbol
+  private symbolPricePrecisionCache: Map<string, number> = new Map(); // Cache price precision per symbol
+  private symbolTickSizeCache: Map<string, number> = new Map(); // Cache tickSize per symbol
 
   constructor(private readonly configService: ConfigService) {
     // Load configuration from environment
@@ -230,12 +234,27 @@ export class AsterExchangeAdapter implements IPerpExchangeAdapter {
   }
 
   async placeOrder(request: PerpOrderRequest): Promise<PerpOrderResponse> {
+    let formattedQuantity: string = request.size.toString(); // Store for error logging
     try {
       // Aster uses BUY/SELL instead of LONG/SHORT
       const asterSide = request.side === OrderSide.LONG ? 'BUY' : 'SELL';
 
-      // Format quantity (size in base asset units)
-      const quantity = request.size.toFixed(8);
+      // Get precision and stepSize for quantity, and pricePrecision and tickSize for price
+      // Fetch exchange info if not cached
+      const { precision, stepSize, pricePrecision, tickSize } = await this.getSymbolPrecision(request.symbol);
+      
+      // Round to nearest stepSize multiple first, then format to precision
+      // This ensures we comply with Aster's LOT_SIZE filter requirements
+      const roundedSize = Math.round(request.size / stepSize) * stepSize;
+      
+      let quantity: string;
+      if (stepSize >= 1 && precision === 0) {
+        // For integer quantities, use toFixed(0) to ensure clean string format
+        quantity = Math.round(roundedSize).toFixed(0);
+      } else {
+        quantity = roundedSize.toFixed(precision);
+      }
+      formattedQuantity = quantity;
 
       const nonce = Math.floor(Date.now() * 1000);
       const orderParams: Record<string, any> = {
@@ -243,14 +262,26 @@ export class AsterExchangeAdapter implements IPerpExchangeAdapter {
         positionSide: 'BOTH', // Required parameter (from working script)
         side: asterSide,
         type: request.type === OrderType.MARKET ? 'MARKET' : 'LIMIT',
-        quantity,
+        quantity, // Always a string, formatted to match Aster's precision requirements
         recvWindow: 50000, // Required for market orders (from working script)
       };
 
       // For LIMIT orders, add price and timeInForce
       // For MARKET orders, do NOT include price (Aster rejects it)
       if (request.type === OrderType.LIMIT && request.price) {
-        orderParams.price = request.price.toFixed(8);
+        // Round to nearest tickSize multiple first, then format to pricePrecision
+        // This ensures we comply with Aster's PRICE_FILTER requirements
+        const roundedPrice = Math.round(request.price / tickSize) * tickSize;
+        
+        let price: string;
+        if (tickSize >= 1 && pricePrecision === 0) {
+          // For integer prices, use toFixed(0) to ensure clean string format
+          price = Math.round(roundedPrice).toFixed(0);
+        } else {
+          price = roundedPrice.toFixed(pricePrecision);
+        }
+        
+        orderParams.price = price;
         orderParams.timeInForce = request.timeInForce || TimeInForce.GTC;
       }
 
@@ -292,9 +323,10 @@ export class AsterExchangeAdapter implements IPerpExchangeAdapter {
           `Response: ${JSON.stringify(error.response.data)}`
         );
         // Log request parameters for debugging (without sensitive data)
+        // Note: Log formatted quantity, not raw size, to match what was actually sent
         this.logger.debug(
           `Order request params: symbol=${request.symbol}, ` +
-          `side=${request.side}, type=${request.type}, size=${request.size}`
+          `side=${request.side}, type=${request.type}, rawSize=${request.size}, formattedQuantity=${formattedQuantity}`
         );
       } else {
         this.logger.error(`Failed to place order: ${error.message}`);
@@ -318,6 +350,118 @@ export class AsterExchangeAdapter implements IPerpExchangeAdapter {
       EXPIRED: OrderStatus.EXPIRED,
     };
     return statusMap[asterStatus] || OrderStatus.PENDING;
+  }
+
+  /**
+   * Calculate precision from a size string (stepSize or tickSize)
+   * Handles scientific notation and trailing zeros correctly
+   */
+  private calculatePrecision(sizeStr: string): number {
+    let precision = 0;
+    if (sizeStr.includes('e-')) {
+      // Scientific notation: "1e-8" means 8 decimal places
+      const match = sizeStr.match(/e-(\d+)/);
+      precision = match ? parseInt(match[1], 10) : 0;
+    } else if (sizeStr.includes('.')) {
+      // Regular decimal: count significant decimal places (remove trailing zeros)
+      // Examples: "0.001" -> 3, "0.0010" -> 3, "0.100" -> 1, "1.0" -> 0
+      const decimalPart = sizeStr.split('.')[1];
+      if (decimalPart) {
+        // Remove trailing zeros to get significant decimal places
+        precision = decimalPart.replace(/0+$/, '').length;
+      }
+    }
+    // If size is an integer (no decimal point), precision is 0 (already set)
+    return precision;
+  }
+
+  /**
+   * Get precision (decimal places) and stepSize for a symbol's quantity
+   * Also gets price precision and tickSize from PRICE_FILTER
+   * Fetches exchange info to get filters from LOT_SIZE and PRICE_FILTER
+   * Caches results to avoid repeated API calls
+   */
+  private async getSymbolPrecision(symbol: string): Promise<{ 
+    precision: number; 
+    stepSize: number;
+    pricePrecision: number;
+    tickSize: number;
+  }> {
+    // Check cache first
+    if (
+      this.symbolPrecisionCache.has(symbol) && 
+      this.symbolStepSizeCache.has(symbol) &&
+      this.symbolPricePrecisionCache.has(symbol) &&
+      this.symbolTickSizeCache.has(symbol)
+    ) {
+      return {
+        precision: this.symbolPrecisionCache.get(symbol)!,
+        stepSize: this.symbolStepSizeCache.get(symbol)!,
+        pricePrecision: this.symbolPricePrecisionCache.get(symbol)!,
+        tickSize: this.symbolTickSizeCache.get(symbol)!,
+      };
+    }
+
+    try {
+      // Fetch exchange info to get stepSize and tickSize
+      const response = await this.client.get('/fapi/v1/exchangeInfo');
+      const symbolInfo = response.data.symbols?.find((s: any) => s.symbol === symbol);
+      
+      if (symbolInfo) {
+        // Get quantity precision from LOT_SIZE filter
+        const quantityFilter = symbolInfo.filters?.find((f: any) => f.filterType === 'LOT_SIZE');
+        let precision = 4; // Default
+        let stepSize = 0.0001; // Default
+        
+        if (quantityFilter?.stepSize) {
+          const stepSizeStr = quantityFilter.stepSize;
+          stepSize = parseFloat(stepSizeStr);
+          precision = this.calculatePrecision(stepSizeStr);
+        }
+        
+        // Get price precision from PRICE_FILTER
+        const priceFilter = symbolInfo.filters?.find((f: any) => f.filterType === 'PRICE_FILTER');
+        let pricePrecision = 8; // Default
+        let tickSize = 0.00000001; // Default
+        
+        if (priceFilter?.tickSize) {
+          const tickSizeStr = priceFilter.tickSize;
+          tickSize = parseFloat(tickSizeStr);
+          pricePrecision = this.calculatePrecision(tickSizeStr);
+        }
+        
+        // Cache all values
+        this.symbolPrecisionCache.set(symbol, precision);
+        this.symbolStepSizeCache.set(symbol, stepSize);
+        this.symbolPricePrecisionCache.set(symbol, pricePrecision);
+        this.symbolTickSizeCache.set(symbol, tickSize);
+        
+        // Log precision only at debug level, less verbose
+        this.logger.debug(`Symbol ${symbol}: qty precision=${precision}, price precision=${pricePrecision}`);
+        
+        return { precision, stepSize, pricePrecision, tickSize };
+      }
+    } catch (error: any) {
+      this.logger.warn(`Could not fetch exchange info for ${symbol}, using default precision: ${error.message}`);
+    }
+
+    // Default values if we can't fetch exchange info
+    const defaultPrecision = 4;
+    const defaultStepSize = 0.0001;
+    const defaultPricePrecision = 8;
+    const defaultTickSize = 0.00000001;
+    
+    this.symbolPrecisionCache.set(symbol, defaultPrecision);
+    this.symbolStepSizeCache.set(symbol, defaultStepSize);
+    this.symbolPricePrecisionCache.set(symbol, defaultPricePrecision);
+    this.symbolTickSizeCache.set(symbol, defaultTickSize);
+    
+    return { 
+      precision: defaultPrecision, 
+      stepSize: defaultStepSize,
+      pricePrecision: defaultPricePrecision,
+      tickSize: defaultTickSize,
+    };
   }
 
   async getPosition(symbol: string): Promise<PerpPosition | null> {

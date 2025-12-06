@@ -311,7 +311,6 @@ export class LighterFundingDataProvider implements OnModuleInit {
         throw new Error(`Lighter API error for market ${marketIndex}: ${errorMsg}`);
       }
       
-      this.logger.log(`  ✅ SUCCESS: OI=$${oiUsd.toLocaleString()}, MarkPrice=$${markPrice.toFixed(2)}`);
       return { openInterest: oiUsd, markPrice };
       
     } catch (error: any) {

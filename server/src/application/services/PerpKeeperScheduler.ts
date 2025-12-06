@@ -5,6 +5,8 @@ import { ConfigService } from '@nestjs/config';
 import { PerpKeeperPerformanceLogger } from '../../infrastructure/logging/PerpKeeperPerformanceLogger';
 import { PerpKeeperService } from './PerpKeeperService';
 import { ExchangeType } from '../../domain/value-objects/ExchangeConfig';
+import { PerpOrderRequest, OrderSide, OrderType, TimeInForce } from '../../domain/value-objects/PerpOrder';
+import { Contract, JsonRpcProvider, Wallet, formatUnits } from 'ethers';
 import * as cliProgress from 'cli-progress';
 
 /**
@@ -172,7 +174,55 @@ export class PerpKeeperScheduler implements OnModuleInit {
 
       this.logger.log(`Found ${opportunities.length} arbitrage opportunities`);
 
-      // Rebalance exchange balances based on opportunities
+      // STEP 1: Close all existing positions to free up margin for rebalancing
+      // This ensures we can use locked margin when rebalancing funds
+      try {
+        this.logger.log('🔍 Checking for existing positions to close before rebalancing...');
+        const positionsResult = await this.orchestrator.getAllPositionsWithMetrics();
+        const allPositions = positionsResult.positions;
+        if (allPositions.length > 0) {
+          this.logger.log(`📋 Found ${allPositions.length} existing position(s) - closing to free up margin...`);
+          for (const position of allPositions) {
+            try {
+              const adapter = this.keeperService.getExchangeAdapter(position.exchangeType);
+              const closeOrder = new PerpOrderRequest(
+                position.symbol,
+                position.side === OrderSide.LONG ? OrderSide.SHORT : OrderSide.LONG,
+                OrderType.MARKET,
+                position.size,
+                0, // No limit price for market orders
+                TimeInForce.IOC, // Immediate or cancel
+                true, // Reduce only
+              );
+              
+              this.logger.log(`   Closing ${position.symbol} on ${position.exchangeType}...`);
+              const closeResponse = await adapter.placeOrder(closeOrder);
+              
+              if (closeResponse.isFilled()) {
+                this.logger.log(`   ✅ Successfully closed position: ${position.symbol} on ${position.exchangeType}`);
+              } else {
+                this.logger.warn(`   ⚠️ Failed to close position ${position.symbol} on ${position.exchangeType}: ${closeResponse.error || 'order not filled'}`);
+              }
+              
+              // Small delay between closes
+              await new Promise(resolve => setTimeout(resolve, 500));
+            } catch (error: any) {
+              this.logger.warn(`   ⚠️ Error closing position ${position.symbol} on ${position.exchangeType}: ${error.message}`);
+            }
+          }
+          
+          // Wait for positions to settle and margin to be freed
+          this.logger.log('⏳ Waiting 2 seconds for positions to settle and margin to be freed...');
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        } else {
+          this.logger.log('✅ No existing positions to close');
+        }
+      } catch (error: any) {
+        this.logger.warn(`Failed to close existing positions: ${error.message}`);
+        // Continue anyway - rebalancing might still work
+      }
+
+      // STEP 2: Rebalance exchange balances based on opportunities
       // Move funds from exchanges without opportunities to exchanges with opportunities
       try {
         this.logger.log('🔄 Rebalancing exchange balances based on opportunities...');
@@ -351,46 +401,152 @@ export class PerpKeeperScheduler implements OnModuleInit {
 
   /**
    * Check balances across all exchanges and warn if insufficient
+   * Also checks for unallocated USDC that could be deployed
    */
   private async checkBalances(): Promise<void> {
     const minBalanceForTrading = 10; // Minimum $10 needed per exchange to cover fees
     const exchanges = [ExchangeType.ASTER, ExchangeType.LIGHTER, ExchangeType.HYPERLIQUID];
     
-    this.logger.log('💰 Checking exchange balances...');
+    this.logger.log('💰 Checking exchange balances and capital allocation...');
     
-    const balances: Array<{ exchange: ExchangeType; balance: number; canTrade: boolean }> = [];
+    // Get all positions to calculate margin used
+    const positionsResult = await this.orchestrator.getAllPositionsWithMetrics();
+    const positionsByExchange = positionsResult.positionsByExchange;
+    
+    // Calculate margin used per exchange (position value / leverage)
+    const leverage = parseFloat(this.configService.get<string>('KEEPER_LEVERAGE') || '2.0');
+    const marginUsedPerExchange = new Map<ExchangeType, number>();
+    
+    for (const [exchangeType, positions] of positionsByExchange) {
+      const totalMarginUsed = positions.reduce((sum, pos) => {
+        // Use marginUsed if available, otherwise calculate as positionValue / leverage
+        const margin = pos.marginUsed ?? (pos.getPositionValue() / leverage);
+        return sum + margin;
+      }, 0);
+      marginUsedPerExchange.set(exchangeType, totalMarginUsed);
+    }
+    
+    const balances: Array<{ 
+      exchange: ExchangeType; 
+      balance: number; 
+      marginUsed: number;
+      totalCapital: number;
+      unallocated: number;
+      canTrade: boolean;
+    }> = [];
     
     for (const exchange of exchanges) {
       try {
-        const balance = await this.keeperService.getBalance(exchange);
-        const canTrade = balance >= minBalanceForTrading;
-        balances.push({ exchange, balance, canTrade });
+        const freeBalance = await this.keeperService.getBalance(exchange);
+        const marginUsed = marginUsedPerExchange.get(exchange) ?? 0;
+        const totalCapital = freeBalance + marginUsed;
+        const unallocated = freeBalance;
+        const canTrade = freeBalance >= minBalanceForTrading;
+        
+        balances.push({ exchange, balance: freeBalance, marginUsed, totalCapital, unallocated, canTrade });
         
         const status = canTrade ? '✅' : '⚠️';
-        this.logger.log(`   ${status} ${exchange}: $${balance.toFixed(2)} ${canTrade ? '(can trade)' : `(need $${minBalanceForTrading}+)`}`);
+        this.logger.log(
+          `   ${status} ${exchange}:\n` +
+          `      Free Balance: $${freeBalance.toFixed(2)}\n` +
+          `      Margin Used: $${marginUsed.toFixed(2)}\n` +
+          `      Total Capital: $${totalCapital.toFixed(2)}\n` +
+          `      Unallocated: $${unallocated.toFixed(2)} ${canTrade ? '(can trade)' : `(need $${minBalanceForTrading}+)`}`
+        );
         
         // For HyperLiquid, also log equity to see total account value
         if (exchange === ExchangeType.HYPERLIQUID) {
           try {
             const equity = await this.keeperService.getEquity(exchange);
-            this.logger.log(`      └─ Equity: $${equity.toFixed(2)} (includes margin used)`);
+            this.logger.log(`      Equity: $${equity.toFixed(2)} (account value)`);
           } catch (e) {
             // Ignore equity fetch errors
           }
         }
       } catch (error: any) {
         this.logger.warn(`   ❌ ${exchange}: Failed to check balance - ${error.message}`);
-        balances.push({ exchange, balance: 0, canTrade: false });
+        balances.push({ exchange, balance: 0, marginUsed: 0, totalCapital: 0, unallocated: 0, canTrade: false });
       }
     }
     
+    // Calculate totals
     const tradableExchanges = balances.filter(b => b.canTrade).length;
-    const totalBalance = balances.reduce((sum, b) => sum + b.balance, 0);
+    const totalFreeBalance = balances.reduce((sum, b) => sum + b.balance, 0);
+    const totalMarginUsed = balances.reduce((sum, b) => sum + b.marginUsed, 0);
+    const totalCapitalOnExchanges = balances.reduce((sum, b) => sum + b.totalCapital, 0);
+    const totalUnallocatedOnExchanges = totalFreeBalance;
     const minBalance = Math.min(...balances.map(b => b.balance).filter(b => b > 0));
     
-    this.logger.log(`   Total balance across exchanges: $${totalBalance.toFixed(2)}`);
+    // Check wallet USDC balance on-chain
+    let walletUsdcBalance = 0;
+    let walletAddress: string | null = null;
+    try {
+      walletUsdcBalance = await this.getWalletUsdcBalance();
+      if (walletUsdcBalance > 0) {
+        // Get wallet address for logging
+        const privateKey = this.configService.get<string>('PRIVATE_KEY');
+        if (privateKey) {
+          const normalizedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+          const wallet = new Wallet(normalizedKey);
+          walletAddress = wallet.address;
+        }
+      }
+    } catch (error: any) {
+      this.logger.debug(`Failed to check wallet USDC balance: ${error.message}`);
+    }
+    
+    // Calculate total capital (on exchanges + in wallet)
+    const totalCapitalAll = totalCapitalOnExchanges + walletUsdcBalance;
+    const totalDeployed = totalMarginUsed;
+    const totalUnallocatedAll = totalFreeBalance + walletUsdcBalance;
+    
+    this.logger.log(`\n   📊 Capital Summary:`);
+    this.logger.log(`      On Exchanges:`);
+    this.logger.log(`         Free Balance: $${totalFreeBalance.toFixed(2)}`);
+    this.logger.log(`         Margin Used: $${totalMarginUsed.toFixed(2)}`);
+    this.logger.log(`         Total on Exchanges: $${totalCapitalOnExchanges.toFixed(2)}`);
+    if (walletUsdcBalance > 0) {
+      this.logger.log(`      In Wallet (${walletAddress ? walletAddress.slice(0, 10) + '...' : 'on-chain'}):`);
+      this.logger.log(`         USDC Balance: $${walletUsdcBalance.toFixed(2)}`);
+    }
+    this.logger.log(`      Total Capital: $${totalCapitalAll.toFixed(2)}`);
+    this.logger.log(`      Total Deployed: $${totalDeployed.toFixed(2)}`);
+    this.logger.log(`      Total Unallocated: $${totalUnallocatedAll.toFixed(2)}`);
+    
     if (minBalance > 0) {
-      this.logger.log(`   Minimum balance (limits position size): $${minBalance.toFixed(2)}`);
+      this.logger.log(`      Minimum balance (limits position size): $${minBalance.toFixed(2)}`);
+    }
+    
+    // Check for significant unallocated capital (on exchanges + in wallet)
+    const unallocatedThreshold = 50; // Warn if more than $50 unallocated
+    if (totalUnallocatedAll > unallocatedThreshold) {
+      const allocationPercent = totalCapitalAll > 0 ? (totalDeployed / totalCapitalAll) * 100 : 0;
+      const walletPercent = totalCapitalAll > 0 ? (walletUsdcBalance / totalCapitalAll) * 100 : 0;
+      
+      this.logger.warn(
+        `⚠️  UNALLOCATED CAPITAL DETECTED: $${totalUnallocatedAll.toFixed(2)} unallocated USDC ` +
+        `(${allocationPercent.toFixed(1)}% deployed, ${(100 - allocationPercent).toFixed(1)}% idle)`
+      );
+      
+      if (walletUsdcBalance > 10) {
+        this.logger.warn(
+          `   💰 Wallet has $${walletUsdcBalance.toFixed(2)} USDC (${walletPercent.toFixed(1)}% of total) - ` +
+          `consider depositing to exchanges to deploy capital`
+        );
+      }
+      
+      if (totalUnallocatedOnExchanges > 10) {
+        this.logger.warn(
+          `   📊 Exchanges have $${totalUnallocatedOnExchanges.toFixed(2)} free balance - ` +
+          `consider increasing position sizes or rebalancing`
+        );
+      }
+    } else if (totalUnallocatedAll > 0) {
+      const allocationPercent = totalCapitalAll > 0 ? (totalDeployed / totalCapitalAll) * 100 : 0;
+      this.logger.log(
+        `✅ Capital allocation: $${totalUnallocatedAll.toFixed(2)} unallocated ` +
+        `(${allocationPercent.toFixed(1)}% deployed)`
+      );
     }
     
     if (tradableExchanges < 2) {
@@ -407,6 +563,62 @@ export class PerpKeeperScheduler implements OnModuleInit {
     }
     
     this.logger.log('');
+  }
+
+  /**
+   * Get wallet USDC balance on-chain
+   * Checks the wallet's USDC balance directly from the blockchain
+   */
+  private async getWalletUsdcBalance(): Promise<number> {
+    try {
+      // Get configuration
+      const rpcUrl = this.configService.get<string>('HYPERLIQUID_RPC_URL') || 
+                     this.configService.get<string>('HYPEREVM_RPC_URL') ||
+                     'https://rpc.hyperliquid.xyz/evm';
+      const privateKey = this.configService.get<string>('PRIVATE_KEY');
+      const walletAddress = this.configService.get<string>('WALLET_ADDRESS') || 
+                           this.configService.get<string>('CENTRAL_WALLET_ADDRESS');
+      
+      if (!privateKey && !walletAddress) {
+        this.logger.debug('No PRIVATE_KEY or WALLET_ADDRESS configured, skipping wallet balance check');
+        return 0;
+      }
+
+      // USDC address on HyperEVM
+      const usdcAddress = '0xb88339CB7199b77E23DB6E890353E22632Ba630f';
+      
+      // ERC20 ABI (minimal)
+      const erc20Abi = [
+        'function balanceOf(address owner) view returns (uint256)',
+        'function decimals() view returns (uint8)',
+      ];
+
+      // Initialize provider
+      const provider = new JsonRpcProvider(rpcUrl);
+      
+      // Get wallet address
+      let address: string;
+      if (walletAddress) {
+        address = walletAddress;
+      } else if (privateKey) {
+        const normalizedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+        const wallet = new Wallet(normalizedKey);
+        address = wallet.address;
+      } else {
+        return 0;
+      }
+
+      // Check USDC balance
+      const usdcContract = new Contract(usdcAddress, erc20Abi, provider);
+      const balance = await usdcContract.balanceOf(address);
+      const decimals = await usdcContract.decimals();
+      const balanceUsd = parseFloat(formatUnits(balance, decimals));
+
+      return balanceUsd;
+    } catch (error: any) {
+      this.logger.debug(`Failed to get wallet USDC balance: ${error.message}`);
+      return 0;
+    }
   }
 }
 
