@@ -260,29 +260,73 @@ export class PerpKeeperPerformanceLogger {
 
   /**
    * Calculate estimated APY based on current funding rates and positions
+   * For arbitrage positions, calculates the NET funding spread (shortRate - longRate)
    * Accounts for position side:
    * - LONG positions: negative funding rate = we receive funding (positive return)
    * - SHORT positions: positive funding rate = we receive funding (positive return)
+   * - For arbitrage pairs: net return = shortRate - longRate (the spread)
    */
   calculateEstimatedAPY(): number {
     if (this.fundingSnapshots.length === 0) return 0;
 
-    // Calculate weighted average funding rate, accounting for position side
-    let totalValue = 0;
-    let weightedFundingReturn = 0; // Renamed to reflect it's the return we receive
-
+    // Group snapshots by symbol to identify arbitrage pairs
+    const snapshotsBySymbol = new Map<string, { long?: FundingRateSnapshot; short?: FundingRateSnapshot }>();
+    
     for (const snapshot of this.fundingSnapshots) {
-      const value = snapshot.positionValue;
-      totalValue += value;
-      
-      // For LONG positions: negative funding rate = we receive funding (positive return)
-      // For SHORT positions: positive funding rate = we receive funding (positive return)
-      // So we flip the sign for LONG positions to get the return we actually receive
-      const fundingReturn = snapshot.positionSide === 'LONG' 
-        ? -snapshot.fundingRate  // LONG: negative rate = positive return
-        : snapshot.fundingRate;   // SHORT: positive rate = positive return
-      
-      weightedFundingReturn += fundingReturn * value;
+      if (!snapshotsBySymbol.has(snapshot.symbol)) {
+        snapshotsBySymbol.set(snapshot.symbol, {});
+      }
+      const pair = snapshotsBySymbol.get(snapshot.symbol)!;
+      if (snapshot.positionSide === 'LONG') {
+        pair.long = snapshot;
+      } else {
+        pair.short = snapshot;
+      }
+    }
+
+    // Calculate weighted average funding rate, accounting for arbitrage pairs
+    let totalValue = 0;
+    let weightedFundingReturn = 0;
+
+    for (const [symbol, pair] of snapshotsBySymbol.entries()) {
+      // If we have both LONG and SHORT positions for this symbol, it's an arbitrage pair
+      if (pair.long && pair.short) {
+        // For arbitrage: net return = shortRate - longRate
+        // This is the spread we capture from the arbitrage
+        const longRate = pair.long.fundingRate;
+        const shortRate = pair.short.fundingRate;
+        const netFundingReturn = shortRate - longRate; // Spread
+        
+        // Use the average position value for the pair
+        const pairValue = (pair.long.positionValue + pair.short.positionValue) / 2;
+        totalValue += pairValue;
+        weightedFundingReturn += netFundingReturn * pairValue;
+        
+        this.logger.debug(
+          `Arbitrage pair ${symbol}: LONG rate=${(longRate * 100).toFixed(4)}%, ` +
+          `SHORT rate=${(shortRate * 100).toFixed(4)}%, ` +
+          `Net spread=${(netFundingReturn * 100).toFixed(4)}%`
+        );
+      } else {
+        // Single position (not part of arbitrage pair) - calculate individually
+        const snapshot = pair.long || pair.short!;
+        const value = snapshot.positionValue;
+        totalValue += value;
+        
+        // For LONG positions: negative funding rate = we receive funding (positive return)
+        // For SHORT positions: positive funding rate = we receive funding (positive return)
+        const fundingReturn = snapshot.positionSide === 'LONG' 
+          ? -snapshot.fundingRate  // LONG: negative rate = positive return
+          : snapshot.fundingRate;   // SHORT: positive rate = positive return
+        
+        weightedFundingReturn += fundingReturn * value;
+        
+        this.logger.debug(
+          `Single position ${symbol} (${snapshot.positionSide}): ` +
+          `rate=${(snapshot.fundingRate * 100).toFixed(4)}%, ` +
+          `return=${(fundingReturn * 100).toFixed(4)}%`
+        );
+      }
     }
 
     if (totalValue === 0) return 0;
@@ -290,11 +334,22 @@ export class PerpKeeperPerformanceLogger {
     const avgFundingReturn = weightedFundingReturn / totalValue;
 
     // Convert per-period rate to annualized APY
-    // Assuming 8-hour funding periods (3 per day)
-    const periodsPerDay = 3;
+    // Funding rates are hourly (24 periods per day)
+    const periodsPerDay = 24;
     const periodsPerYear = periodsPerDay * 365;
     const dailyRate = avgFundingReturn * periodsPerDay;
     const annualizedAPY = dailyRate * 365 * 100; // Convert to percentage
+
+    const arbitragePairsCount = Array.from(snapshotsBySymbol.values()).filter(p => p.long && p.short).length;
+    const singlePositionsCount = Array.from(snapshotsBySymbol.values()).filter(p => !(p.long && p.short)).length;
+    
+    this.logger.debug(
+      `Estimated APY calculation: ` +
+      `${arbitragePairsCount} arbitrage pair(s), ${singlePositionsCount} single position(s), ` +
+      `avgFundingReturn=${(avgFundingReturn * 100).toFixed(4)}%, ` +
+      `dailyRate=${(dailyRate * 100).toFixed(4)}%, ` +
+      `annualizedAPY=${annualizedAPY.toFixed(2)}%`
+    );
 
     return annualizedAPY;
   }
