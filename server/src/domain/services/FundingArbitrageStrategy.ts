@@ -9,6 +9,7 @@ import { HistoricalFundingRateService, HistoricalMetrics } from '../../infrastru
 import { PositionLossTracker } from '../../infrastructure/services/PositionLossTracker';
 import { PerpKeeperPerformanceLogger } from '../../infrastructure/logging/PerpKeeperPerformanceLogger';
 import { PortfolioRiskAnalyzer } from '../../infrastructure/services/PortfolioRiskAnalyzer';
+import { ExchangeBalanceRebalancer } from './ExchangeBalanceRebalancer';
 
 /**
  * Execution plan for an arbitrage opportunity
@@ -77,6 +78,7 @@ export class FundingArbitrageStrategy {
     private readonly lossTracker: PositionLossTracker,
     private readonly portfolioRiskAnalyzer: PortfolioRiskAnalyzer,
     @Optional() private readonly performanceLogger?: PerpKeeperPerformanceLogger,
+    @Optional() private readonly balanceRebalancer?: ExchangeBalanceRebalancer,
   ) {
     // Get leverage from config, default to 2.0x
     // Leverage improves net returns: 2x leverage = 2x funding returns, but fees stay same %
@@ -1763,14 +1765,26 @@ export class FundingArbitrageStrategy {
       const totalAvailableCapital = Array.from(exchangeBalances.values()).reduce((sum, balance) => sum + balance, 0);
       
       // Get opportunities with maxPortfolioFor35APY and sort by maxPortfolio (best opportunities first)
+      // Filter to only include opportunities where we have sufficient balance on BOTH exchanges
       // Sort by expected return first, then by maxPortfolio as tiebreaker
       const opportunitiesWithMaxPortfolio = allEvaluatedOpportunities
-        .filter((item) => 
-          item.maxPortfolioFor35APY !== null && 
-          item.maxPortfolioFor35APY !== undefined && 
-          item.maxPortfolioFor35APY > 0 &&
-          item.plan !== null
-        )
+        .filter((item) => {
+          // Must have valid maxPortfolioFor35APY and plan
+          if (item.maxPortfolioFor35APY === null || 
+              item.maxPortfolioFor35APY === undefined || 
+              item.maxPortfolioFor35APY <= 0 ||
+              item.plan === null) {
+            return false;
+          }
+          
+          // Check if we have sufficient balance on BOTH exchanges for this opportunity
+          const requiredCollateral = item.maxPortfolioFor35APY / this.leverage;
+          const longBalance = exchangeBalances.get(item.opportunity.longExchange) ?? 0;
+          const shortBalance = exchangeBalances.get(item.opportunity.shortExchange) ?? 0;
+          
+          // Both exchanges must have sufficient balance
+          return longBalance >= requiredCollateral && shortBalance >= requiredCollateral;
+        })
         .sort((a, b) => {
           // First sort by expected return (highest first)
           const returnDiff = (b.opportunity.expectedReturn || 0) - (a.opportunity.expectedReturn || 0);
@@ -2167,22 +2181,59 @@ export class FundingArbitrageStrategy {
     }
 
     // Get balances to check availability (but use allocation amount, not balance)
-    const [longBalance, shortBalance] = await Promise.all([
+    let [longBalance, shortBalance] = await Promise.all([
       longAdapter.getBalance(),
       shortAdapter.getBalance(),
     ]);
 
     // Check if we have enough balance for the allocation
     // Allocation is the notional size (with leverage), so we need allocation / leverage as collateral
+    // For arbitrage, we need sufficient balance on BOTH exchanges (not just the minimum)
     const requiredCollateral = allocationUsd / this.leverage;
-    const minBalance = Math.min(longBalance, shortBalance);
     
-    if (minBalance < requiredCollateral) {
+    // Check both exchanges have sufficient balance
+    if (longBalance < requiredCollateral || shortBalance < requiredCollateral) {
+      const minBalance = Math.min(longBalance, shortBalance);
       this.logger.warn(
         `Insufficient balance for ${opportunity.symbol}: ` +
-        `Need $${requiredCollateral.toFixed(2)} collateral, have $${minBalance.toFixed(2)}`
+        `Need $${requiredCollateral.toFixed(2)} collateral on BOTH exchanges, ` +
+        `have ${opportunity.longExchange}: $${longBalance.toFixed(2)}, ` +
+        `${opportunity.shortExchange}: $${shortBalance.toFixed(2)} ` +
+        `(min: $${minBalance.toFixed(2)})`
       );
-      return null;
+      
+      // Attempt to rebalance capital to meet requirements
+      const rebalanceSuccess = await this.attemptRebalanceForOpportunity(
+        opportunity,
+        adapters,
+        requiredCollateral,
+        longBalance,
+        shortBalance
+      );
+      
+      if (!rebalanceSuccess) {
+        this.logger.warn(`Rebalancing failed for ${opportunity.symbol}, skipping opportunity`);
+        return null;
+      }
+      
+      // Re-check balances after rebalancing
+      const [updatedLongBalance, updatedShortBalance] = await Promise.all([
+        longAdapter.getBalance(),
+        shortAdapter.getBalance(),
+      ]);
+      
+      if (updatedLongBalance < requiredCollateral || updatedShortBalance < requiredCollateral) {
+        this.logger.warn(
+          `Still insufficient balance after rebalancing for ${opportunity.symbol}: ` +
+          `${opportunity.longExchange}: $${updatedLongBalance.toFixed(2)}, ` +
+          `${opportunity.shortExchange}: $${updatedShortBalance.toFixed(2)}`
+        );
+        return null;
+      }
+      
+      // Use updated balances
+      longBalance = updatedLongBalance;
+      shortBalance = updatedShortBalance;
     }
 
     // Use the allocation amount as position size (notional, with leverage)
@@ -2195,6 +2246,210 @@ export class FundingArbitrageStrategy {
       longBalance,
       shortBalance,
     );
+  }
+
+  /**
+   * Attempt to rebalance capital to meet balance requirements for an opportunity
+   * Priority order:
+   * 1. Withdraw from unused exchanges (exchanges not part of this opportunity)
+   * 2. Transfer from the exchange with excess balance to the one with deficit
+   * 3. Attempt to deposit from wallet (if supported)
+   */
+  private async attemptRebalanceForOpportunity(
+    opportunity: ArbitrageOpportunity,
+    adapters: Map<ExchangeType, IPerpExchangeAdapter>,
+    requiredCollateral: number,
+    longBalance: number,
+    shortBalance: number,
+  ): Promise<boolean> {
+    if (!this.balanceRebalancer) {
+      this.logger.warn('ExchangeBalanceRebalancer not available, cannot rebalance');
+      return false;
+    }
+
+    const longExchange = opportunity.longExchange;
+    const shortExchange = opportunity.shortExchange;
+    const longAdapter = adapters.get(longExchange);
+    const shortAdapter = adapters.get(shortExchange);
+
+    if (!longAdapter || !shortAdapter) {
+      return false;
+    }
+
+    this.logger.log(
+      `🔄 Attempting to rebalance capital for ${opportunity.symbol}: ` +
+      `Need $${requiredCollateral.toFixed(2)} on both ${longExchange} and ${shortExchange}`
+    );
+
+    // Get all exchange balances to identify unused exchanges
+    const allBalances = await this.balanceRebalancer.getExchangeBalances(adapters);
+    const unusedExchanges: ExchangeType[] = [];
+    
+    for (const [exchange, balance] of allBalances) {
+      if (exchange !== longExchange && exchange !== shortExchange && balance > 0) {
+        unusedExchanges.push(exchange);
+        this.logger.log(`   Found unused exchange ${exchange} with $${balance.toFixed(2)}`);
+      }
+    }
+
+    // Calculate deficits
+    const longDeficit = Math.max(0, requiredCollateral - longBalance);
+    const shortDeficit = Math.max(0, requiredCollateral - shortBalance);
+    const totalDeficit = longDeficit + shortDeficit;
+
+    if (totalDeficit === 0) {
+      this.logger.log('✅ No rebalancing needed - both exchanges have sufficient balance');
+      return true;
+    }
+
+    // Strategy 1: Withdraw from unused exchanges and distribute to needed exchanges
+    let totalAvailableFromUnused = 0;
+    for (const exchange of unusedExchanges) {
+      const balance = allBalances.get(exchange) ?? 0;
+      totalAvailableFromUnused += balance;
+    }
+
+    if (totalAvailableFromUnused > 0 && totalDeficit > 0) {
+      this.logger.log(
+        `   Strategy 1: Found $${totalAvailableFromUnused.toFixed(2)} on unused exchanges, ` +
+        `need $${totalDeficit.toFixed(2)} total`
+      );
+
+      // Distribute unused funds proportionally to deficits
+      const longShare = totalDeficit > 0 ? longDeficit / totalDeficit : 0;
+      const shortShare = totalDeficit > 0 ? shortDeficit / totalDeficit : 0;
+      const longNeeded = Math.min(longDeficit, totalAvailableFromUnused * longShare);
+      const shortNeeded = Math.min(shortDeficit, totalAvailableFromUnused * shortShare);
+
+      // Transfer from unused exchanges to needed exchanges
+      let remainingLongNeeded = longNeeded;
+      let remainingShortNeeded = shortNeeded;
+
+      for (const unusedExchange of unusedExchanges) {
+        if (remainingLongNeeded <= 0 && remainingShortNeeded <= 0) break;
+
+        let unusedBalance = allBalances.get(unusedExchange) ?? 0;
+        if (unusedBalance <= 0) continue;
+
+        const unusedAdapter = adapters.get(unusedExchange);
+        if (!unusedAdapter) continue;
+
+        // Transfer to long exchange if needed
+        if (remainingLongNeeded > 0 && unusedBalance > 0) {
+          const transferAmount = Math.min(remainingLongNeeded, unusedBalance);
+          try {
+            this.logger.log(
+              `   📤 Transferring $${transferAmount.toFixed(2)} from ${unusedExchange} to ${longExchange}...`
+            );
+            await (this.balanceRebalancer as any).transferBetweenExchanges(
+              unusedExchange,
+              longExchange,
+              transferAmount,
+              unusedAdapter,
+              longAdapter
+            );
+            remainingLongNeeded -= transferAmount;
+            unusedBalance -= transferAmount;
+            allBalances.set(unusedExchange, unusedBalance);
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for transfer to settle
+          } catch (error: any) {
+            this.logger.warn(`   ⚠️ Failed to transfer from ${unusedExchange} to ${longExchange}: ${error.message}`);
+          }
+        }
+
+        // Transfer to short exchange if needed
+        if (remainingShortNeeded > 0 && unusedBalance > 0) {
+          const transferAmount = Math.min(remainingShortNeeded, unusedBalance);
+          try {
+            this.logger.log(
+              `   📤 Transferring $${transferAmount.toFixed(2)} from ${unusedExchange} to ${shortExchange}...`
+            );
+            await (this.balanceRebalancer as any).transferBetweenExchanges(
+              unusedExchange,
+              shortExchange,
+              transferAmount,
+              unusedAdapter,
+              shortAdapter
+            );
+            remainingShortNeeded -= transferAmount;
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for transfer to settle
+          } catch (error: any) {
+            this.logger.warn(`   ⚠️ Failed to transfer from ${unusedExchange} to ${shortExchange}: ${error.message}`);
+          }
+        }
+      }
+    }
+
+    // Strategy 2: Rebalance between the two exchanges if one has excess
+    const updatedLongBalance = await longAdapter.getBalance();
+    const updatedShortBalance = await shortAdapter.getBalance();
+    const updatedLongDeficit = Math.max(0, requiredCollateral - updatedLongBalance);
+    const updatedShortDeficit = Math.max(0, requiredCollateral - updatedShortBalance);
+
+    if (updatedLongDeficit > 0 && updatedShortBalance > requiredCollateral) {
+      // Short has excess, transfer to long
+      const excess = updatedShortBalance - requiredCollateral;
+      const transferAmount = Math.min(updatedLongDeficit, excess);
+      if (transferAmount > 0) {
+        try {
+          this.logger.log(
+            `   Strategy 2: Transferring $${transferAmount.toFixed(2)} from ${shortExchange} (excess) to ${longExchange} (deficit)...`
+          );
+          await (this.balanceRebalancer as any).transferBetweenExchanges(
+            shortExchange,
+            longExchange,
+            transferAmount,
+            shortAdapter,
+            longAdapter
+          );
+          await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for transfer to settle
+        } catch (error: any) {
+          this.logger.warn(`   ⚠️ Failed to transfer between exchanges: ${error.message}`);
+        }
+      }
+    } else if (updatedShortDeficit > 0 && updatedLongBalance > requiredCollateral) {
+      // Long has excess, transfer to short
+      const excess = updatedLongBalance - requiredCollateral;
+      const transferAmount = Math.min(updatedShortDeficit, excess);
+      if (transferAmount > 0) {
+        try {
+          this.logger.log(
+            `   Strategy 2: Transferring $${transferAmount.toFixed(2)} from ${longExchange} (excess) to ${shortExchange} (deficit)...`
+          );
+          await (this.balanceRebalancer as any).transferBetweenExchanges(
+            longExchange,
+            shortExchange,
+            transferAmount,
+            longAdapter,
+            shortAdapter
+          );
+          await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for transfer to settle
+        } catch (error: any) {
+          this.logger.warn(`   ⚠️ Failed to transfer between exchanges: ${error.message}`);
+        }
+      }
+    }
+
+    // Final check
+    const finalLongBalance = await longAdapter.getBalance();
+    const finalShortBalance = await shortAdapter.getBalance();
+    const finalLongDeficit = Math.max(0, requiredCollateral - finalLongBalance);
+    const finalShortDeficit = Math.max(0, requiredCollateral - finalShortBalance);
+
+    if (finalLongDeficit === 0 && finalShortDeficit === 0) {
+      this.logger.log(
+        `✅ Rebalancing successful! Both exchanges now have sufficient balance: ` +
+        `${longExchange}: $${finalLongBalance.toFixed(2)}, ${shortExchange}: $${finalShortBalance.toFixed(2)}`
+      );
+      return true;
+    } else {
+      this.logger.warn(
+        `⚠️ Rebalancing partially successful but still insufficient: ` +
+        `${longExchange}: $${finalLongBalance.toFixed(2)} (need $${requiredCollateral.toFixed(2)}), ` +
+        `${shortExchange}: $${finalShortBalance.toFixed(2)} (need $${requiredCollateral.toFixed(2)})`
+      );
+      return false;
+    }
   }
 
   /**
