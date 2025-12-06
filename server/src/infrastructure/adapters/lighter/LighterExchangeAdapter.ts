@@ -702,10 +702,12 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
     try {
       await this.ensureInitialized();
       
-      // Lighter SDK doesn't have getOrder method on OrderApi
-      // For now, return a default response indicating order was submitted
-      // In production, you would need to query Lighter's API directly or use a different SDK method
-      this.logger.warn('getOrderStatus not fully implemented for Lighter - SDK limitation');
+      // Lighter SDK limitation: The @reservoir0x/lighter-ts-sdk doesn't provide a method to query order status
+      // by order ID. This means we can't reliably check if an order has filled.
+      // The SDK only provides order placement methods, not order status queries.
+      // As a workaround, we return SUBMITTED status and rely on position checks to verify fills.
+      // In production, you would need to query Lighter's API directly or implement a custom order tracking system.
+      this.logger.debug('getOrderStatus: Lighter SDK limitation - cannot query order status by ID, using position checks instead');
       
       return new PerpOrderResponse(
         orderId,

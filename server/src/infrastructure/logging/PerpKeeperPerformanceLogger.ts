@@ -309,6 +309,7 @@ export class PerpKeeperPerformanceLogger {
         );
       } else {
         // Single position (not part of arbitrage pair) - calculate individually
+        // WARNING: This should be part of an arbitrage pair for proper delta-neutral strategy
         const snapshot = pair.long || pair.short!;
         const value = snapshot.positionValue;
         totalValue += value;
@@ -321,10 +322,11 @@ export class PerpKeeperPerformanceLogger {
         
         weightedFundingReturn += fundingReturn * value;
         
-        this.logger.debug(
-          `Single position ${symbol} (${snapshot.positionSide}): ` +
-          `rate=${(snapshot.fundingRate * 100).toFixed(4)}%, ` +
-          `return=${(fundingReturn * 100).toFixed(4)}%`
+        this.logger.warn(
+          `⚠️ Single position ${symbol} (${snapshot.positionSide}) detected - should be part of arbitrage pair. ` +
+          `Rate=${(snapshot.fundingRate * 100).toFixed(4)}%, ` +
+          `Return=${(fundingReturn * 100).toFixed(4)}%. ` +
+          `This may indicate one leg failed to open or was closed.`
         );
       }
     }

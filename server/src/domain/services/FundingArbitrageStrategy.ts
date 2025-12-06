@@ -66,10 +66,34 @@ export class FundingArbitrageStrategy {
     [ExchangeType.ASTER, 0.00005],       // 0.0050% maker fee
     [ExchangeType.LIGHTER, 0],            // 0% fees (no trading fees)
   ]);
+
+  // Taker fee rates (for market orders when completing asymmetric fills)
+  private readonly TAKER_FEE_RATES: Map<ExchangeType, number> = new Map([
+    [ExchangeType.HYPERLIQUID, 0.0002],  // 0.0200% taker fee (tier 0)
+    [ExchangeType.ASTER, 0.0004],         // 0.0400% taker fee
+    [ExchangeType.LIGHTER, 0],            // 0% fees (no trading fees)
+  ]);
   
   // Small price improvement to ensure limit orders fill quickly while remaining maker orders
   // 0.01% improvement makes orders competitive but still adds liquidity to the book
   private readonly LIMIT_ORDER_PRICE_IMPROVEMENT = 0.0001; // 0.01%
+
+  // Asymmetric fill tracking: one leg filled, other on book
+  private readonly asymmetricFills: Map<string, {
+    symbol: string;
+    longFilled: boolean;
+    shortFilled: boolean;
+    longOrderId?: string;
+    shortOrderId?: string;
+    longExchange: ExchangeType;
+    shortExchange: ExchangeType;
+    positionSize: number;
+    opportunity: ArbitrageOpportunity;
+    timestamp: Date;
+  }> = new Map();
+
+  // Timeout for asymmetric fills (10 minutes)
+  private readonly ASYMMETRIC_FILL_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
   constructor(
     private readonly aggregator: FundingRateAggregator,
@@ -1577,15 +1601,15 @@ export class FundingArbitrageStrategy {
         [...profitable, ...unprofitable].forEach((item, index) => {
           const isProfitable = item.plan !== null;
           const prefix = isProfitable ? `  ${index + 1}.` : '  ⚠️';
-          const maxPortfolioInfo = item.maxPortfolioFor35APY !== null && item.maxPortfolioFor35APY !== undefined
+        const maxPortfolioInfo = item.maxPortfolioFor35APY !== null && item.maxPortfolioFor35APY !== undefined
             ? ` | Max: $${(item.maxPortfolioFor35APY / 1000).toFixed(1)}k`
             : '';
-          this.logger.log(
-            `${prefix} ${item.opportunity.symbol}: ` +
-            `APY: ${(item.opportunity.expectedReturn * 100).toFixed(2)}% | ` +
+        this.logger.log(
+          `${prefix} ${item.opportunity.symbol}: ` +
+          `APY: ${(item.opportunity.expectedReturn * 100).toFixed(2)}% | ` +
             `Net: $${item.netReturn !== -Infinity ? item.netReturn.toFixed(4) : 'N/A'}/period${maxPortfolioInfo}`
-          );
-        });
+        );
+      });
       }
 
       // Log optimal portfolio allocation results
@@ -1733,8 +1757,8 @@ export class FundingArbitrageStrategy {
       if (opportunitiesWithMaxPortfolio.length === 0) {
         this.logger.warn('No opportunities with maxPortfolioFor35APY available for portfolio execution');
         // Fall back to single best opportunity
-        executionPlans.sort((a, b) => b.plan.expectedNetReturn - a.plan.expectedNetReturn);
-        const bestOpportunity = executionPlans[0];
+      executionPlans.sort((a, b) => b.plan.expectedNetReturn - a.plan.expectedNetReturn);
+      const bestOpportunity = executionPlans[0];
         return await this.executeSinglePosition(bestOpportunity, adapters, result, this.lossTracker);
       }
       
@@ -1820,7 +1844,7 @@ export class FundingArbitrageStrategy {
               remainingCapital -= topUpAmount;
               
               const isFullyFilled = topUpAmount >= additionalCollateralNeeded - 0.01;
-              this.logger.log(
+      this.logger.log(
                 `   🔼 ${symbol}: Adding $${topUpAmount.toFixed(2)} ` +
                 `(${isFullyFilled ? 'FULL' : 'PARTIAL'}) | Remaining: $${remainingCapital.toFixed(2)}`
               );
@@ -1862,7 +1886,7 @@ export class FundingArbitrageStrategy {
             remainingCapital -= partialCollateral;
             
             const isFullyFilled = partialCollateral >= maxCollateral - 0.01;
-            this.logger.log(
+          this.logger.log(
               `   ${isFullyFilled ? '✅' : '🔄'} ${symbol}: NEW $${partialMaxPortfolio.toFixed(2)} ` +
               `($${partialCollateral.toFixed(2)}/${maxCollateral.toFixed(2)} collateral, ${isFullyFilled ? 'FULL' : 'PARTIAL'}) | ` +
               `Remaining: $${remainingCapital.toFixed(2)}`
@@ -1891,10 +1915,10 @@ export class FundingArbitrageStrategy {
       
       if (selectedOpportunities.length === 0) {
         this.logger.warn('⚠️ Insufficient capital to open any positions');
-        return result;
-      }
-      
-      this.logger.log(
+          return result;
+        }
+        
+        this.logger.log(
         `\n📊 Allocation: ${selectedOpportunities.length} positions, ` +
         `$${(totalAvailableCapital - remainingCapital).toFixed(2)} used, ` +
         `$${remainingCapital.toFixed(2)} remaining`
@@ -1914,13 +1938,25 @@ export class FundingArbitrageStrategy {
         }
       }
       
+      // Handle asymmetric fills from previous execution cycles
+      await this.handleAsymmetricFills(adapters, result);
+
       if (positionsToClose.length > 0) {
         this.logger.log(`🔄 Closing ${positionsToClose.length} position(s)...`);
-        await this.closeAllPositions(positionsToClose, adapters, result);
+        const closeResult = await this.closeAllPositions(positionsToClose, adapters, result);
+        
+        if (closeResult.stillOpen.length > 0) {
+          this.logger.warn(
+            `⚠️ ${closeResult.stillOpen.length} position(s) failed to close and still exist. ` +
+            `Their margin remains locked: ${closeResult.stillOpen.map(p => `${p.symbol} on ${p.exchangeType}`).join(', ')}`
+          );
+        }
+        
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
       
       // Refresh balances after closing positions (they may have changed)
+      // This accounts for positions that failed to close (their margin is still locked)
       for (const [exchange, adapter] of adapters) {
         try {
           const allPositions = await adapter.getPositions();
@@ -1931,6 +1967,14 @@ export class FundingArbitrageStrategy {
           const totalBalance = await adapter.getBalance();
           const availableBalance = Math.max(0, totalBalance - marginUsed);
           exchangeBalances.set(exchange, availableBalance);
+          
+          if (marginUsed > 0) {
+            this.logger.debug(
+              `${exchange}: Total: $${totalBalance.toFixed(2)}, ` +
+              `Margin locked: $${marginUsed.toFixed(2)}, ` +
+              `Available: $${availableBalance.toFixed(2)}`
+            );
+          }
         } catch (error: any) {
           this.logger.debug(`Failed to refresh balance for ${exchange}: ${error.message}`);
         }
@@ -1987,34 +2031,39 @@ export class FundingArbitrageStrategy {
 
   /**
    * Close all existing positions
+   * Returns positions that were successfully closed and positions that still exist
    */
   private async closeAllPositions(
     positions: PerpPosition[],
     adapters: Map<ExchangeType, IPerpExchangeAdapter>,
     result: ArbitrageExecutionResult,
-  ): Promise<void> {
+  ): Promise<{ closed: PerpPosition[]; stillOpen: PerpPosition[] }> {
+    const closed: PerpPosition[] = [];
+    const stillOpen: PerpPosition[] = [];
+    
     for (const position of positions) {
-      try {
-        const adapter = adapters.get(position.exchangeType);
-        if (!adapter) {
-          this.logger.warn(`No adapter found for ${position.exchangeType}, cannot close position`);
-          continue;
-        }
+          try {
+            const adapter = adapters.get(position.exchangeType);
+            if (!adapter) {
+              this.logger.warn(`No adapter found for ${position.exchangeType}, cannot close position`);
+          stillOpen.push(position);
+              continue;
+            }
 
-        // Close position by placing opposite order
-        const closeOrder = new PerpOrderRequest(
-          position.symbol,
-          position.side === OrderSide.LONG ? OrderSide.SHORT : OrderSide.LONG,
-          OrderType.MARKET,
-          position.size,
-        );
+            // Close position by placing opposite order
+            const closeOrder = new PerpOrderRequest(
+              position.symbol,
+              position.side === OrderSide.LONG ? OrderSide.SHORT : OrderSide.LONG,
+              OrderType.MARKET,
+              position.size,
+            );
 
-        this.logger.log(
-          `📤 Closing position: ${position.symbol} ${position.side} ${position.size.toFixed(4)} on ${position.exchangeType}`
-        );
+            this.logger.log(
+              `📤 Closing position: ${position.symbol} ${position.side} ${position.size.toFixed(4)} on ${position.exchangeType}`
+            );
 
-        const closeResponse = await adapter.placeOrder(closeOrder);
-        
+            const closeResponse = await adapter.placeOrder(closeOrder);
+            
         // Wait and retry if order didn't fill immediately
         let finalResponse = closeResponse;
         if (!closeResponse.isFilled() && closeResponse.orderId) {
@@ -2029,37 +2078,59 @@ export class FundingArbitrageStrategy {
           );
         }
         
-        if (finalResponse.isSuccess() && finalResponse.isFilled()) {
-          // Record position exit in loss tracker
-          const exitFeeRate = this.EXCHANGE_FEE_RATES.get(position.exchangeType) || 0.0005;
-          const positionValueUsd = position.size * (position.markPrice || 0);
-          const exitCost = exitFeeRate * positionValueUsd;
-          
-          // Calculate realized loss (simplified - assumes break-even if no P&L data)
-          const realizedLoss = -exitCost; // Exit cost is a loss
-          
-          this.lossTracker.recordPositionExit(
-            position.symbol,
-            position.exchangeType,
-            exitCost,
-            realizedLoss,
-          );
-          
-          this.logger.log(`✅ Successfully closed position: ${position.symbol} on ${position.exchangeType}`);
-        } else {
-          this.logger.warn(
-            `⚠️ Failed to close position ${position.symbol} on ${position.exchangeType}: ${finalResponse.error || 'order not filled'}`
-          );
-          result.errors.push(`Failed to close position ${position.symbol} on ${position.exchangeType}`);
-        }
+        // Verify position is actually closed by checking positions again
+        // This is important because some exchanges (like Lighter) don't have reliable order status
+        await new Promise(resolve => setTimeout(resolve, 500)); // Small delay for position to update
+        const currentPositions = await adapter.getPositions();
+        const positionStillExists = currentPositions.some(
+          p => p.symbol === position.symbol && 
+               p.exchangeType === position.exchangeType &&
+               Math.abs(p.size) > 0.0001 // Position still exists if size > 0
+        );
+        
+        if (finalResponse.isSuccess() && finalResponse.isFilled() && !positionStillExists) {
+              // Record position exit in loss tracker
+              const exitFeeRate = this.EXCHANGE_FEE_RATES.get(position.exchangeType) || 0.0005;
+              const positionValueUsd = position.size * (position.markPrice || 0);
+              const exitCost = exitFeeRate * positionValueUsd;
+              
+              // Calculate realized loss (simplified - assumes break-even if no P&L data)
+              const realizedLoss = -exitCost; // Exit cost is a loss
+              
+              this.lossTracker.recordPositionExit(
+                position.symbol,
+                position.exchangeType,
+                exitCost,
+                realizedLoss,
+              );
+              
+              this.logger.log(`✅ Successfully closed position: ${position.symbol} on ${position.exchangeType}`);
+          closed.push(position);
+            } else {
+          if (positionStillExists) {
+              this.logger.warn(
+              `⚠️ Position ${position.symbol} on ${position.exchangeType} still exists after close attempt. ` +
+              `Margin remains locked. Will account for this in balance calculations.`
+              );
+          } else {
+            this.logger.warn(
+              `⚠️ Failed to close position ${position.symbol} on ${position.exchangeType}: ${finalResponse.error || 'order not filled'}`
+            );
+          }
+              result.errors.push(`Failed to close position ${position.symbol} on ${position.exchangeType}`);
+          stillOpen.push(position);
+            }
 
-        // Small delay between closes to avoid rate limits
-        await new Promise(resolve => setTimeout(resolve, 200));
-      } catch (error: any) {
-        this.logger.error(`Error closing position ${position.symbol} on ${position.exchangeType}: ${error.message}`);
-        result.errors.push(`Error closing position ${position.symbol}: ${error.message}`);
+            // Small delay between closes to avoid rate limits
+            await new Promise(resolve => setTimeout(resolve, 200));
+          } catch (error: any) {
+            this.logger.error(`Error closing position ${position.symbol} on ${position.exchangeType}: ${error.message}`);
+            result.errors.push(`Error closing position ${position.symbol}: ${error.message}`);
+        stillOpen.push(position);
       }
     }
+    
+    return { closed, stillOpen };
   }
 
   /**
@@ -2148,6 +2219,232 @@ export class FundingArbitrageStrategy {
   }
 
   /**
+   * Check if arbitrage is still profitable with taker fees (for market orders)
+   */
+  private checkProfitabilityWithTakerFees(
+    opportunity: ArbitrageOpportunity,
+    positionSizeUsd: number,
+  ): { profitable: boolean; expectedNetReturn: number } {
+    const longMakerFeeRate = this.EXCHANGE_FEE_RATES.get(opportunity.longExchange) || 0.0005;
+    const shortTakerFeeRate = this.TAKER_FEE_RATES.get(opportunity.shortExchange) || 0.0004;
+    
+    // One side already filled (maker fee), other will use taker fee
+    const longEntryFee = positionSizeUsd * longMakerFeeRate;
+    const shortEntryFee = positionSizeUsd * shortTakerFeeRate;
+    const totalEntryFees = longEntryFee + shortEntryFee;
+    
+    // Estimate slippage for market order (conservative)
+    const marketSlippage = 0.0005; // 0.05% slippage for market orders
+    const slippageCost = positionSizeUsd * marketSlippage;
+    
+    // Exit fees (both sides will pay maker fees when closing)
+    const longExitFeeRate = this.EXCHANGE_FEE_RATES.get(opportunity.longExchange) || 0.0005;
+    const shortExitFeeRate = this.EXCHANGE_FEE_RATES.get(opportunity.shortExchange) || 0.0005;
+    const totalExitFees = positionSizeUsd * (longExitFeeRate + shortExitFeeRate);
+    
+    const totalCosts = totalEntryFees + totalExitFees + slippageCost;
+    
+    // Calculate expected return
+    const periodsPerDay = 24;
+    const periodsPerYear = periodsPerDay * 365;
+    const expectedReturnPerPeriod = (opportunity.expectedReturn / periodsPerYear) * positionSizeUsd;
+    
+    if (expectedReturnPerPeriod > 0) {
+      const breakEvenHours = totalCosts / expectedReturnPerPeriod;
+      const amortizationPeriods = Math.max(1, Math.min(24, Math.ceil(breakEvenHours)));
+      const amortizedCostsPerPeriod = totalCosts / amortizationPeriods;
+      const expectedNetReturn = expectedReturnPerPeriod - amortizedCostsPerPeriod;
+      
+      return {
+        profitable: expectedNetReturn > 0,
+        expectedNetReturn,
+      };
+    }
+    
+    return {
+      profitable: false,
+      expectedNetReturn: -totalCosts,
+    };
+  }
+
+  /**
+   * Handle asymmetric fills: one leg filled, other on book
+   * Option 1: Cancel unfilled and close filled position (safest)
+   * Option 2: Convert unfilled to market order if still profitable (maintains arbitrage)
+   */
+  private async handleAsymmetricFills(
+    adapters: Map<ExchangeType, IPerpExchangeAdapter>,
+    result: ArbitrageExecutionResult,
+  ): Promise<void> {
+    const now = new Date();
+    const fillsToHandle: Array<{
+      key: string;
+      fill: NonNullable<ReturnType<typeof this.asymmetricFills.get>>;
+    }> = [];
+
+    // Find fills that exceeded timeout
+    for (const [key, fill] of this.asymmetricFills.entries()) {
+      const ageMs = now.getTime() - fill.timestamp.getTime();
+      if (ageMs >= this.ASYMMETRIC_FILL_TIMEOUT_MS) {
+        fillsToHandle.push({ key, fill });
+      }
+    }
+
+    if (fillsToHandle.length === 0) {
+      return;
+    }
+
+    this.logger.warn(
+      `⚠️ Handling ${fillsToHandle.length} asymmetric fill(s) that exceeded timeout...`
+    );
+
+    for (const { key, fill } of fillsToHandle) {
+      try {
+        const { symbol, longFilled, shortFilled, longOrderId, shortOrderId, longExchange, shortExchange, positionSize, opportunity } = fill;
+        
+        const longAdapter = adapters.get(longExchange);
+        const shortAdapter = adapters.get(shortExchange);
+        
+        if (!longAdapter || !shortAdapter) {
+          this.logger.warn(`Missing adapters for ${symbol}, skipping asymmetric fill handling`);
+          this.asymmetricFills.delete(key);
+          continue;
+        }
+
+        // Determine which side filled and which is on book
+        const filledSide = longFilled ? 'LONG' : 'SHORT';
+        const unfilledOrderId = longFilled ? shortOrderId : longOrderId;
+        const unfilledAdapter = longFilled ? shortAdapter : longAdapter;
+        const filledAdapter = longFilled ? longAdapter : shortAdapter;
+        const unfilledExchange = longFilled ? shortExchange : longExchange;
+        const filledExchange = longFilled ? longExchange : shortExchange;
+        
+        // Check current profitability with taker fees
+        const markPrice = longFilled 
+          ? (opportunity.longMarkPrice || 0)
+          : (opportunity.shortMarkPrice || 0);
+        const positionSizeUsd = positionSize * markPrice;
+        
+        const profitability = this.checkProfitabilityWithTakerFees(opportunity, positionSizeUsd);
+        
+        if (profitability.profitable) {
+          // Option 2: Cancel GTC order and place market order to complete arbitrage
+          this.logger.log(
+            `📋 ${symbol}: Arbitrage still profitable with taker fees ` +
+            `($${profitability.expectedNetReturn.toFixed(4)}/period). ` +
+            `Cancelling GTC order and placing market order to complete pair...`
+          );
+          
+          // Cancel unfilled GTC order
+          if (unfilledOrderId) {
+            try {
+              await unfilledAdapter.cancelOrder(unfilledOrderId, symbol);
+              this.logger.log(`✅ Cancelled GTC order ${unfilledOrderId} on ${unfilledExchange}`);
+            } catch (error: any) {
+              this.logger.warn(`Failed to cancel GTC order ${unfilledOrderId}: ${error.message}`);
+            }
+          }
+          
+          // Place market order to complete the pair
+          const marketOrder = new PerpOrderRequest(
+            symbol,
+            longFilled ? OrderSide.SHORT : OrderSide.LONG,
+            OrderType.MARKET,
+            positionSize,
+          );
+          
+          const marketResponse = await unfilledAdapter.placeOrder(marketOrder);
+          
+          if (marketResponse.isSuccess() && marketResponse.isFilled()) {
+            this.logger.log(
+              `✅ ${symbol}: Market order filled, arbitrage pair complete. ` +
+              `Net return: $${profitability.expectedNetReturn.toFixed(4)}/period`
+            );
+            this.asymmetricFills.delete(key);
+          } else {
+            this.logger.warn(
+              `⚠️ ${symbol}: Market order failed to fill. ` +
+              `Falling back to closing filled position...`
+            );
+            // Fall through to Option 1
+            await this.closeFilledPosition(filledAdapter, symbol, filledSide, positionSize, filledExchange, result);
+            this.asymmetricFills.delete(key);
+          }
+        } else {
+          // Option 1: Cancel unfilled order and close filled position
+          this.logger.warn(
+            `⚠️ ${symbol}: Arbitrage no longer profitable with taker fees ` +
+            `($${profitability.expectedNetReturn.toFixed(4)}/period). ` +
+            `Cancelling GTC order and closing filled position...`
+          );
+          
+          // Cancel unfilled GTC order
+          if (unfilledOrderId) {
+            try {
+              await unfilledAdapter.cancelOrder(unfilledOrderId, symbol);
+              this.logger.log(`✅ Cancelled GTC order ${unfilledOrderId} on ${unfilledExchange}`);
+            } catch (error: any) {
+              this.logger.warn(`Failed to cancel GTC order ${unfilledOrderId}: ${error.message}`);
+            }
+          }
+          
+          // Close filled position
+          await this.closeFilledPosition(filledAdapter, symbol, filledSide, positionSize, filledExchange, result);
+          this.asymmetricFills.delete(key);
+        }
+      } catch (error: any) {
+        this.logger.error(`Error handling asymmetric fill ${fill.symbol}: ${error.message}`);
+        result.errors.push(`Failed to handle asymmetric fill ${fill.symbol}: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Close a filled position (helper for asymmetric fill handling)
+   */
+  private async closeFilledPosition(
+    adapter: IPerpExchangeAdapter,
+    symbol: string,
+    side: 'LONG' | 'SHORT',
+    size: number,
+    exchangeType: ExchangeType,
+    result: ArbitrageExecutionResult,
+  ): Promise<void> {
+    try {
+      const closeOrder = new PerpOrderRequest(
+        symbol,
+        side === 'LONG' ? OrderSide.SHORT : OrderSide.LONG,
+        OrderType.MARKET,
+        size,
+      );
+      
+      this.logger.log(`📤 Closing ${side} position: ${symbol} ${size.toFixed(4)}`);
+      
+      const closeResponse = await adapter.placeOrder(closeOrder);
+      
+      if (!closeResponse.isFilled() && closeResponse.orderId) {
+        await this.waitForOrderFill(
+          adapter,
+          closeResponse.orderId,
+          symbol,
+          exchangeType,
+          size,
+        );
+      }
+      
+      if (closeResponse.isSuccess() && closeResponse.isFilled()) {
+        this.logger.log(`✅ Successfully closed ${side} position: ${symbol}`);
+      } else {
+        this.logger.warn(`⚠️ Failed to close ${side} position: ${symbol}`);
+        result.errors.push(`Failed to close ${side} position ${symbol}`);
+      }
+    } catch (error: any) {
+      this.logger.error(`Error closing filled position ${symbol}: ${error.message}`);
+      result.errors.push(`Error closing filled position ${symbol}: ${error.message}`);
+    }
+  }
+
+  /**
    * Create execution plan with specific allocation amount (for portfolio execution)
    */
   private async createExecutionPlanWithAllocation(
@@ -2165,26 +2462,44 @@ export class FundingArbitrageStrategy {
       return null;
     }
 
-    // Get balances to check availability (but use allocation amount, not balance)
-    let [longBalance, shortBalance] = await Promise.all([
+    // Get balances and positions to calculate available balance (accounting for locked margin)
+    const [longBalance, shortBalance, longPositions, shortPositions] = await Promise.all([
       longAdapter.getBalance(),
       shortAdapter.getBalance(),
+      longAdapter.getPositions(),
+      shortAdapter.getPositions(),
     ]);
+    
+    // Calculate margin used from existing positions
+    const longMarginUsed = longPositions.reduce((sum, pos) => {
+      const posValue = pos.getPositionValue();
+      return sum + (pos.marginUsed ?? (posValue / this.leverage));
+    }, 0);
+    const shortMarginUsed = shortPositions.reduce((sum, pos) => {
+      const posValue = pos.getPositionValue();
+      return sum + (pos.marginUsed ?? (posValue / this.leverage));
+    }, 0);
+    
+    // Available balance = total balance - margin locked in existing positions
+    let longAvailable = Math.max(0, longBalance - longMarginUsed);
+    let shortAvailable = Math.max(0, shortBalance - shortMarginUsed);
 
     // Check if we have enough balance for the allocation
     // Allocation is the notional size (with leverage), so we need allocation / leverage as collateral
     // For arbitrage, we need sufficient balance on BOTH exchanges (not just the minimum)
     const requiredCollateral = allocationUsd / this.leverage;
     
-    // Check both exchanges have sufficient balance
-    if (longBalance < requiredCollateral || shortBalance < requiredCollateral) {
-      const minBalance = Math.min(longBalance, shortBalance);
+    // Check both exchanges have sufficient AVAILABLE balance (not just total balance)
+    if (longAvailable < requiredCollateral || shortAvailable < requiredCollateral) {
+      const minAvailable = Math.min(longAvailable, shortAvailable);
       this.logger.warn(
-        `Insufficient balance for ${opportunity.symbol}: ` +
+        `Insufficient available balance for ${opportunity.symbol}: ` +
         `Need $${requiredCollateral.toFixed(2)} collateral on BOTH exchanges, ` +
-        `have ${opportunity.longExchange}: $${longBalance.toFixed(2)}, ` +
-        `${opportunity.shortExchange}: $${shortBalance.toFixed(2)} ` +
-        `(min: $${minBalance.toFixed(2)})`
+        `${opportunity.longExchange}: $${longAvailable.toFixed(2)} available ` +
+        `(total: $${longBalance.toFixed(2)}, margin locked: $${longMarginUsed.toFixed(2)}), ` +
+        `${opportunity.shortExchange}: $${shortAvailable.toFixed(2)} available ` +
+        `(total: $${shortBalance.toFixed(2)}, margin locked: $${shortMarginUsed.toFixed(2)}) ` +
+        `(min available: $${minAvailable.toFixed(2)})`
       );
       
       // Attempt to rebalance capital to meet requirements
@@ -2192,8 +2507,8 @@ export class FundingArbitrageStrategy {
         opportunity,
         adapters,
         requiredCollateral,
-        longBalance,
-        shortBalance
+        longAvailable,
+        shortAvailable
       );
       
       if (!rebalanceSuccess) {
@@ -2201,35 +2516,52 @@ export class FundingArbitrageStrategy {
         return null;
       }
       
-      // Re-check balances after rebalancing
-      const [updatedLongBalance, updatedShortBalance] = await Promise.all([
+      // Re-check balances and positions after rebalancing
+      const [updatedLongBalance, updatedShortBalance, updatedLongPositions, updatedShortPositions] = await Promise.all([
         longAdapter.getBalance(),
         shortAdapter.getBalance(),
+        longAdapter.getPositions(),
+        shortAdapter.getPositions(),
       ]);
       
-      if (updatedLongBalance < requiredCollateral || updatedShortBalance < requiredCollateral) {
+      const updatedLongMarginUsed = updatedLongPositions.reduce((sum, pos) => {
+        const posValue = pos.getPositionValue();
+        return sum + (pos.marginUsed ?? (posValue / this.leverage));
+      }, 0);
+      const updatedShortMarginUsed = updatedShortPositions.reduce((sum, pos) => {
+        const posValue = pos.getPositionValue();
+        return sum + (pos.marginUsed ?? (posValue / this.leverage));
+      }, 0);
+      
+      const updatedLongAvailable = Math.max(0, updatedLongBalance - updatedLongMarginUsed);
+      const updatedShortAvailable = Math.max(0, updatedShortBalance - updatedShortMarginUsed);
+      
+      if (updatedLongAvailable < requiredCollateral || updatedShortAvailable < requiredCollateral) {
         this.logger.warn(
-          `Still insufficient balance after rebalancing for ${opportunity.symbol}: ` +
-          `${opportunity.longExchange}: $${updatedLongBalance.toFixed(2)}, ` +
-          `${opportunity.shortExchange}: $${updatedShortBalance.toFixed(2)}`
+          `Still insufficient available balance after rebalancing for ${opportunity.symbol}: ` +
+          `${opportunity.longExchange}: $${updatedLongAvailable.toFixed(2)} available ` +
+          `(total: $${updatedLongBalance.toFixed(2)}, margin locked: $${updatedLongMarginUsed.toFixed(2)}), ` +
+          `${opportunity.shortExchange}: $${updatedShortAvailable.toFixed(2)} available ` +
+          `(total: $${updatedShortBalance.toFixed(2)}, margin locked: $${updatedShortMarginUsed.toFixed(2)})`
         );
         return null;
       }
       
-      // Use updated balances
-      longBalance = updatedLongBalance;
-      shortBalance = updatedShortBalance;
+      // Use updated available balances
+      longAvailable = updatedLongAvailable;
+      shortAvailable = updatedShortAvailable;
     }
 
     // Use the allocation amount as position size (notional, with leverage)
+    // Pass available balances (not total balances) to ensure we don't exceed available margin
     return this.createExecutionPlanWithBalances(
       opportunity,
       adapters,
       allocationUsd, // Use allocation as max position size
       longMarkPrice,
       shortMarkPrice,
-      longBalance,
-      shortBalance,
+      longAvailable,
+      shortAvailable,
     );
   }
 
@@ -2461,7 +2793,7 @@ export class FundingArbitrageStrategy {
         `${shortExchange}: $${finalShortAvailable.toFixed(2)}`
       );
       return true;
-    } else {
+      } else {
       this.logger.warn(
         `Rebalancing insufficient: ${longExchange}: $${finalLongAvailable.toFixed(2)} (need $${requiredCollateral.toFixed(2)}), ` +
         `${shortExchange}: $${finalShortAvailable.toFixed(2)} (need $${requiredCollateral.toFixed(2)})`
@@ -2696,17 +3028,62 @@ export class FundingArbitrageStrategy {
           }
         }
 
-        // Check if both orders succeeded and filled
-        const longSuccess = finalLongResponse.isSuccess() && finalLongResponse.isFilled();
-        const shortSuccess = finalShortResponse.isSuccess() && finalShortResponse.isFilled();
+        // Check if both orders succeeded
+        // For GTC LIMIT orders, SUBMITTED status is fine - they're on the book
+        // Only treat as failure if REJECTED, CANCELLED, or has error
+        const longIsGTC = plan.longOrder.timeInForce === TimeInForce.GTC;
+        const shortIsGTC = plan.shortOrder.timeInForce === TimeInForce.GTC;
+        const longSuccess = finalLongResponse.isSuccess() && 
+          (finalLongResponse.isFilled() || (longIsGTC && finalLongResponse.status === OrderStatus.SUBMITTED));
+        const shortSuccess = finalShortResponse.isSuccess() && 
+          (finalShortResponse.isFilled() || (shortIsGTC && finalShortResponse.status === OrderStatus.SUBMITTED));
         
-        // Handle partial fills
+        // Handle partial fills and GTC orders on book
         const longFilled = finalLongResponse.filledSize || 0;
         const shortFilled = finalShortResponse.filledSize || 0;
-        const minFilled = Math.min(longFilled, shortFilled);
-        const isPartialFill = (longSuccess && shortSuccess) && (minFilled < plan.positionSize - 0.0001);
+        const minFilled = Math.min(longFilled || plan.positionSize, shortFilled || plan.positionSize);
+        const isPartialFill = (longSuccess && shortSuccess) && 
+          (longFilled > 0 || shortFilled > 0) && 
+          (minFilled < plan.positionSize - 0.0001);
+        const longFullyFilled = longFilled >= plan.positionSize - 0.0001;
+        const shortFullyFilled = shortFilled >= plan.positionSize - 0.0001;
+        const longOnBook = longIsGTC && finalLongResponse.status === OrderStatus.SUBMITTED && !longFullyFilled;
+        const shortOnBook = shortIsGTC && finalShortResponse.status === OrderStatus.SUBMITTED && !shortFullyFilled;
+        
+        // Detect asymmetric fill: one side filled, other on book
+        const asymmetricFill = (longFullyFilled && shortOnBook) || (shortFullyFilled && longOnBook);
+        
+        if (asymmetricFill) {
+          const fillKey = `${opportunity.symbol}-${opportunity.longExchange}-${opportunity.shortExchange}`;
+          this.asymmetricFills.set(fillKey, {
+            symbol: opportunity.symbol,
+            longFilled: longFullyFilled,
+            shortFilled: shortFullyFilled,
+            longOrderId: longResponse.orderId,
+            shortOrderId: shortResponse.orderId,
+            longExchange: opportunity.longExchange,
+            shortExchange: opportunity.shortExchange,
+            positionSize: plan.positionSize,
+            opportunity,
+            timestamp: new Date(),
+          });
+          
+          this.logger.warn(
+            `⚠️ ASYMMETRIC FILL DETECTED: ${opportunity.symbol} - ` +
+            `${longFullyFilled ? 'LONG filled' : 'SHORT filled'} but ` +
+            `${longOnBook ? 'LONG' : 'SHORT'} still on book (GTC). ` +
+            `Will check after ${this.ASYMMETRIC_FILL_TIMEOUT_MS / 1000 / 60} minutes...`
+          );
+        }
         
         if (longSuccess && shortSuccess) {
+          if (longOnBook || shortOnBook) {
+            this.logger.log(
+              `📋 [${i + 1}/${opportunities.length}] ${opportunity.symbol}: ` +
+              `Orders placed on book (GTC)${longOnBook && shortOnBook ? ' - both' : longOnBook ? ' - LONG' : ' - SHORT'}. ` +
+              `Will fill when price is reached.`
+            );
+          }
           if (isPartialFill) {
             this.logger.warn(
               `⚠️ Partial fill for ${opportunity.symbol}: ` +
@@ -2775,24 +3152,44 @@ export class FundingArbitrageStrategy {
             this.logger.debug(`Failed to refresh balances after execution: ${error.message}`);
           }
         } else {
-          // Execution failed - capital remains available for next opportunity
-          const longError = finalLongResponse.error || (finalLongResponse.isFilled() ? 'none' : 'not filled');
-          const shortError = finalShortResponse.error || (finalShortResponse.isFilled() ? 'none' : 'not filled');
+          // Execution failed - check if orders are on book (GTC) or actually failed
+          const longOnBook = longIsGTC && finalLongResponse.status === OrderStatus.SUBMITTED && !finalLongResponse.error;
+          const shortOnBook = shortIsGTC && finalShortResponse.status === OrderStatus.SUBMITTED && !finalShortResponse.error;
+          
+          if (longOnBook || shortOnBook) {
+            // Orders are on book (GTC) - this is fine, they'll fill when price is reached
+            this.logger.log(
+              `📋 [${i + 1}/${opportunities.length}] ${opportunity.symbol}: ` +
+              `Orders on book (GTC)${longOnBook && shortOnBook ? ' - both' : longOnBook ? ' - LONG' : ' - SHORT'}. ` +
+              `Capital remains available until filled.`
+            );
+            // Don't count as error - orders are on book
+          } else {
+            // Actual failure - capital remains available for next opportunity
+            const longError = finalLongResponse.error || 
+              (finalLongResponse.isFilled() ? 'none' : 
+               finalLongResponse.status === OrderStatus.REJECTED ? 'rejected' : 
+               finalLongResponse.status === OrderStatus.CANCELLED ? 'cancelled' : 'not filled');
+            const shortError = finalShortResponse.error || 
+              (finalShortResponse.isFilled() ? 'none' : 
+               finalShortResponse.status === OrderStatus.REJECTED ? 'rejected' : 
+               finalShortResponse.status === OrderStatus.CANCELLED ? 'cancelled' : 'not filled');
           result.errors.push(
             `Order execution failed for ${opportunity.symbol}: ` +
-            `Long: ${longError}, Short: ${shortError}`
-          );
-          this.logger.warn(
-            `❌ [${i + 1}/${opportunities.length}] ${opportunity.symbol} failed: ` +
-            `${longError} / ${shortError}`
-          );
+              `Long: ${longError}, Short: ${shortError}`
+            );
+            this.logger.warn(
+              `❌ [${i + 1}/${opportunities.length}] ${opportunity.symbol} failed: ` +
+              `${longError} / ${shortError}`
+            );
+          }
         }
 
         // Small delay between position executions to avoid rate limits
         if (i < opportunities.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 500));
         }
-      } catch (error: any) {
+    } catch (error: any) {
         result.errors.push(`Error executing ${item.opportunity.symbol}: ${error.message}`);
         this.logger.error(`Failed to execute ${item.opportunity.symbol}: ${error.message}. Capital remains available.`);
       }
@@ -3126,7 +3523,13 @@ export class FundingArbitrageStrategy {
     // Close existing positions
     const allPositions = await this.getAllPositions(adapters);
     if (allPositions.length > 0) {
-      await this.closeAllPositions(allPositions, adapters, result);
+      const closeResult = await this.closeAllPositions(allPositions, adapters, result);
+      if (closeResult.stillOpen.length > 0) {
+        this.logger.warn(
+          `⚠️ ${closeResult.stillOpen.length} position(s) failed to close: ` +
+          `${closeResult.stillOpen.map(p => `${p.symbol} on ${p.exchangeType}`).join(', ')}`
+        );
+      }
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 

@@ -361,7 +361,6 @@ export class HistoricalFundingRateService implements OnModuleInit {
     
     // Deduplicate and sort by timestamp
     const deduplicated = this.deduplicateEntries(allEntries);
-    this.logger.debug(`✅ Hyperliquid: Total ${deduplicated.length} unique entries for ${symbol} (from ${requestCount} requests)`);
     
     return deduplicated;
   }
@@ -513,7 +512,6 @@ export class HistoricalFundingRateService implements OnModuleInit {
         });
       }
       
-      this.logger.debug(`✅ Lighter: Extracted ${rates.length} historical entries for ${symbol} (market ${marketIndex})`);
       return rates.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
     } catch (error: any) {
       this.logger.error(`❌ Failed to fetch Lighter historical data for ${symbol}: ${error.message}${error.response ? ` (HTTP ${error.response.status})` : ''}`);
@@ -600,7 +598,6 @@ export class HistoricalFundingRateService implements OnModuleInit {
                 totalFetched++;
                 hyperliquidCount++;
               }
-              this.logger.debug(`✅ Hyperliquid: ${hyperliquidData.length} entries for ${symbol} (${mapping.hyperliquidSymbol})`);
             } else {
               hyperliquidFailed++;
             }
@@ -620,7 +617,6 @@ export class HistoricalFundingRateService implements OnModuleInit {
                 totalFetched++;
                 asterCount++;
               }
-              this.logger.debug(`✅ Aster: ${asterData.length} entries for ${symbol} (${mapping.asterSymbol})`);
             } else {
               asterFailed++;
             }
