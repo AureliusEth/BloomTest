@@ -1298,116 +1298,154 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
         throw new Error('Deposit amount must be greater than 0');
       }
 
-      this.logger.log(`Depositing $${amount.toFixed(2)} ${asset} to Lighter Gateway...`);
+      // Only USDC is supported for deposits
+      if (asset.toUpperCase() !== 'USDC') {
+        throw new Error(`Only USDC deposits are supported. Received: ${asset}`);
+      }
 
-      // Lighter deposits are done via the Gateway contract on Ethereum mainnet
-      // Process: 1) Approve gateway to spend tokens, 2) Call gateway.deposit(token, amount)
+      this.logger.log(`Depositing $${amount.toFixed(2)} ${asset} to Lighter...`);
+
+      // Lighter deposit contract on Arbitrum
+      // User confirmed: transfer to 0xB512443BB7737E90401DEF0BCF442aB5454A94f8
+      const LIGHTER_DEPOSIT_CONTRACT = '0xB512443BB7737E90401DEF0BCF442aB5454A94f8';
+      const USDC_CONTRACT_ADDRESS = '0xaf88d065e77c8cC2239327C5EDb3A432268e5831'; // USDC on Arbitrum
       
-      // Get configuration
-      const privateKey = this.configService.get<string>('PRIVATE_KEY');
-      const ethereumRpcUrl = this.configService.get<string>('ETHEREUM_RPC_URL') || 
-                             this.configService.get<string>('ETH_MAINNET_RPC_URL') ||
-                             'https://eth.llamarpc.com'; // Public RPC fallback
+      // Get Arbitrum RPC URL
+      const arbitrumRpcUrl = this.configService.get<string>('ARBITRUM_RPC_URL') ||
+                             this.configService.get<string>('ARB_RPC_URL') ||
+                             'https://arb1.arbitrum.io/rpc'; // Public RPC fallback
       
-      // Lighter Gateway Contract address on Ethereum mainnet
-      // Default: 0x3B4D794a66304F130a4Db8F2551B0070dfCf5ca7
-      // Can be overridden via LIGHTER_GATEWAY_CONTRACT env var
-      const gatewayAddress = this.configService.get<string>('LIGHTER_GATEWAY_CONTRACT') || 
-                             '0x3B4D794a66304F130a4Db8F2551B0070dfCf5ca7';
-      
+      // Get private key for signing transactions
+      const privateKey = this.configService.get<string>('PRIVATE_KEY') || 
+                        this.configService.get<string>('LIGHTER_PRIVATE_KEY');
       if (!privateKey) {
-        throw new Error('PRIVATE_KEY required for on-chain deposits. Provide PRIVATE_KEY in .env.');
+        throw new Error('PRIVATE_KEY or LIGHTER_PRIVATE_KEY required for on-chain deposits');
       }
 
-      // Map asset symbol to Ethereum mainnet token address
-      const tokenAddresses: Record<string, string> = {
-        'USDC': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // USDC on Ethereum mainnet (6 decimals)
-        'USDT': '0xdAC17F958D2ee523a2206206994597C13D831ec7', // USDT on Ethereum mainnet (6 decimals)
-        'WETH': '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', // WETH on Ethereum mainnet (18 decimals)
-      };
-      
-      const tokenAddress = tokenAddresses[asset.toUpperCase()];
-      if (!tokenAddress) {
-        throw new Error(
-          `Asset ${asset} not supported for Lighter deposits. ` +
-          `Supported assets: ${Object.keys(tokenAddresses).join(', ')}`
-        );
-      }
-
-      // Get token decimals (USDC/USDT = 6, WETH = 18)
-      const decimals = asset.toUpperCase() === 'WETH' ? 18 : 6;
-      const amountWei = ethers.parseUnits(amount.toFixed(decimals), decimals);
-
-      // Initialize Ethereum provider and wallet
-      const provider = new ethers.JsonRpcProvider(ethereumRpcUrl);
-      const normalizedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
-      const wallet = new ethers.Wallet(normalizedKey, provider);
-      const walletAddress = wallet.address;
+      const normalizedPrivateKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+      const provider = new ethers.JsonRpcProvider(arbitrumRpcUrl);
+      const wallet = new ethers.Wallet(normalizedPrivateKey, provider);
 
       this.logger.debug(
-        `Deposit details: wallet=${walletAddress}, token=${tokenAddress} (${asset}), ` +
-        `amount=${amount} (${amountWei.toString()} wei), gateway=${gatewayAddress}`
+        `Lighter deposit details:\n` +
+        `  Deposit contract: ${LIGHTER_DEPOSIT_CONTRACT}\n` +
+        `  USDC contract: ${USDC_CONTRACT_ADDRESS}\n` +
+        `  Amount: ${amount} USDC\n` +
+        `  Wallet: ${wallet.address}\n` +
+        `  RPC: ${arbitrumRpcUrl}`
       );
 
-      // ERC20 ABI (minimal - just what we need)
+      // ERC20 ABI for USDC (approve, transfer, allowance, balanceOf, decimals)
       const erc20Abi = [
-        'function balanceOf(address owner) view returns (uint256)',
-        'function approve(address spender, uint256 amount) returns (bool)',
-        'function allowance(address owner, address spender) view returns (uint256)',
-        'function decimals() view returns (uint8)',
+        'function approve(address spender, uint256 amount) external returns (bool)',
+        'function transfer(address to, uint256 amount) external returns (bool)',
+        'function allowance(address owner, address spender) external view returns (uint256)',
+        'function balanceOf(address account) external view returns (uint256)',
+        'function decimals() external view returns (uint8)',
       ];
 
-      // Gateway ABI (minimal - just deposit function)
-      const gatewayAbi = [
-        'function deposit(address token, uint256 amount) external',
-        'function getBalance(address user, address token) external view returns (uint256)',
-      ];
+      const usdcContract = new ethers.Contract(USDC_CONTRACT_ADDRESS, erc20Abi, wallet);
 
-      // Create contract instances
-      const tokenContract = new ethers.Contract(tokenAddress, erc20Abi, wallet);
-      const gatewayContract = new ethers.Contract(gatewayAddress, gatewayAbi, wallet);
+      // Get USDC decimals (convert BigInt to number)
+      const decimalsBigInt = await usdcContract.decimals();
+      const decimals = Number(decimalsBigInt);
+      const amountWei = ethers.parseUnits(amount.toFixed(decimals), decimals);
 
-      // Step 1: Check wallet balance
-      const balance = await tokenContract.balanceOf(walletAddress);
-      if (balance < amountWei) {
-        throw new Error(
-          `Insufficient balance. Wallet has ${ethers.formatUnits(balance, decimals)} ${asset}, ` +
-          `but ${amount} ${asset} is required.`
+      // Wait for funds to arrive (similar to Hyperliquid - withdrawals take time)
+      const maxWaitTime = 300000; // 5 minutes maximum wait
+      const initialDelay = 2000; // 2 seconds initial delay
+      const maxDelay = 30000; // 30 seconds max delay between checks
+      const startTime = Date.now();
+      let attempt = 0;
+      let balanceFormatted = 0;
+      let balanceWei: bigint;
+      
+      // Wait for funds to arrive (at least the requested amount)
+      while (true) {
+        attempt++;
+        balanceWei = await usdcContract.balanceOf(wallet.address);
+        balanceFormatted = Number(ethers.formatUnits(balanceWei, decimals));
+        
+        this.logger.debug(
+          `Balance check attempt ${attempt}: ${balanceFormatted.toFixed(2)} USDC ` +
+          `(requested: ${amount.toFixed(2)} USDC)`
+        );
+
+        // Wait until we have at least the requested amount
+        if (balanceFormatted >= amount) {
+          this.logger.log(
+            `✅ Funds arrived. Available balance: ${balanceFormatted.toFixed(2)} USDC`
+          );
+          break;
+        }
+
+        const elapsed = Date.now() - startTime;
+        if (elapsed >= maxWaitTime) {
+          throw new Error(
+            `Insufficient USDC balance after ${Math.floor(elapsed / 1000)}s wait. ` +
+            `Required: ${amount.toFixed(2)} USDC, Available: ${balanceFormatted.toFixed(2)} USDC. ` +
+            `Funds may still be in transit from withdrawal.`
+          );
+        }
+
+        // Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s
+        const delay = Math.min(initialDelay * Math.pow(2, attempt - 1), maxDelay);
+        const remaining = maxWaitTime - elapsed;
+        const waitTime = Math.min(delay, remaining);
+        
+        this.logger.warn(
+          `Waiting for funds to arrive. ` +
+          `Current: ${balanceFormatted.toFixed(2)} USDC, Required: ${amount.toFixed(2)} USDC. ` +
+          `Waiting ${waitTime / 1000}s (attempt ${attempt}, ${Math.floor(elapsed / 1000)}s elapsed)...`
+        );
+        
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+
+      // Determine deposit amount:
+      // - If balance is significantly larger than requested amount (3x+), deposit only requested amount
+      //   (this indicates a wallet deposit, not a rebalance from withdrawal)
+      // - Otherwise, deposit full balance (this handles rebalancing where withdrawal fees reduce the amount)
+      const isWalletDeposit = balanceFormatted >= amount * 3;
+      const depositAmount = isWalletDeposit ? amount : balanceFormatted;
+      const depositAmountWei = isWalletDeposit 
+        ? ethers.parseUnits(depositAmount.toFixed(decimals), decimals)
+        : balanceWei;
+
+      // Check current allowance
+      const currentAllowance = await usdcContract.allowance(wallet.address, LIGHTER_DEPOSIT_CONTRACT);
+      
+      // Approve deposit contract if needed
+      if (currentAllowance < depositAmountWei) {
+        this.logger.log(`Approving Lighter deposit contract to spend ${depositAmount.toFixed(2)} USDC...`);
+        const approveTx = await usdcContract.approve(LIGHTER_DEPOSIT_CONTRACT, depositAmountWei);
+        await approveTx.wait();
+        this.logger.log(`✅ Approval confirmed: ${approveTx.hash}`);
+      }
+
+      // Transfer USDC to Lighter deposit contract
+      if (isWalletDeposit) {
+        this.logger.log(
+          `Transferring ${depositAmount.toFixed(2)} USDC (requested amount) to Lighter deposit contract... ` +
+          `(wallet has ${balanceFormatted.toFixed(2)} USDC total, depositing only ${depositAmount.toFixed(2)} USDC)`
+        );
+      } else {
+        this.logger.log(
+          `Transferring ${depositAmount.toFixed(2)} USDC (full wallet balance) to Lighter deposit contract... ` +
+          `(requested amount was ${amount.toFixed(2)} USDC, but depositing available balance after fees)`
         );
       }
-
-      // Step 2: Check current allowance
-      const currentAllowance = await tokenContract.allowance(walletAddress, gatewayAddress);
-      this.logger.debug(`Current allowance: ${ethers.formatUnits(currentAllowance, decimals)} ${asset}`);
-
-      // Step 3: Approve gateway if needed
-      if (currentAllowance < amountWei) {
-        this.logger.log(`Approving gateway to spend ${amount} ${asset}...`);
-        const approveTx = await tokenContract.approve(gatewayAddress, amountWei);
-        this.logger.debug(`Approval transaction: ${approveTx.hash}`);
-        const approveReceipt = await approveTx.wait();
-        this.logger.log(`✅ Approval confirmed in block ${approveReceipt.blockNumber}`);
-      } else {
-        this.logger.debug(`Sufficient allowance already exists (${ethers.formatUnits(currentAllowance, decimals)} ${asset})`);
-      }
-
-      // Step 4: Deposit to gateway
-      this.logger.log(`Depositing ${amount} ${asset} to Lighter Gateway...`);
-      const depositTx = await gatewayContract.deposit(tokenAddress, amountWei);
-      this.logger.debug(`Deposit transaction: ${depositTx.hash}`);
       
-      const depositReceipt = await depositTx.wait();
-      this.logger.log(
-        `✅ Deposit successful! TX: ${depositReceipt.hash}, Block: ${depositReceipt.blockNumber}`
-      );
-
-      // Step 5: Verify balance in gateway
-      const gatewayBalance = await gatewayContract.getBalance(walletAddress, tokenAddress);
-      this.logger.log(
-        `Gateway balance after deposit: ${ethers.formatUnits(gatewayBalance, decimals)} ${asset}`
-      );
-
-      return depositReceipt.hash;
+      const transferTx = await usdcContract.transfer(LIGHTER_DEPOSIT_CONTRACT, depositAmountWei);
+      this.logger.log(`⏳ Deposit transaction submitted: ${transferTx.hash}`);
+      const receipt = await transferTx.wait();
+      
+      if (receipt.status === 1) {
+        this.logger.log(`✅ Deposit successful! Transaction: ${receipt.hash}, Block: ${receipt.blockNumber}`);
+        return receipt.hash;
+      } else {
+        throw new Error(`Deposit transaction failed: ${receipt.hash}`);
+      }
     } catch (error: any) {
       if (error instanceof ExchangeError) {
         throw error;
