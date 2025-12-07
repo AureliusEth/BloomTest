@@ -699,9 +699,20 @@ export class PerpKeeperScheduler implements OnModuleInit {
           // Wait a bit between deposits to avoid rate limits
           await new Promise((resolve) => setTimeout(resolve, 2000));
         } catch (error: any) {
+          // Check if it's a 404 error (endpoint doesn't exist) - Aster may require on-chain deposits
+          if (error.message?.includes('404') || error.message?.includes('on-chain')) {
+            this.logger.warn(
+              `⚠️ ${exchange} deposits may require on-chain transactions. ` +
+              `Skipping deposit to ${exchange}. Funds remain in wallet. ` +
+              `Error: ${error.message}`,
+            );
+            // Don't subtract from remaining balance - funds stay in wallet
+            continue;
+          }
           this.logger.warn(
             `Failed to deposit $${depositAmount.toFixed(2)} to ${exchange}: ${error.message}`,
           );
+          // Don't subtract on error - funds remain in wallet for retry
         }
       }
 

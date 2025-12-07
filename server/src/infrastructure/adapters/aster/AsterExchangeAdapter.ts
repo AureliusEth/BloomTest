@@ -1049,80 +1049,111 @@ export class AsterExchangeAdapter implements IPerpExchangeAdapter {
         throw new Error('Deposit amount must be greater than 0');
       }
 
-      this.logger.log(`Depositing $${amount.toFixed(2)} ${asset} to Aster...`);
+      // Only USDC is supported for deposits
+      if (asset.toUpperCase() !== 'USDC') {
+        throw new Error(`Only USDC deposits are supported. Received: ${asset}`);
+      }
 
-      // Aster deposits use EIP712 signature (similar to withdrawals)
-      // Documentation: https://github.com/asterdex/api-docs/blob/master/aster-deposit-withdrawal.md
-      // Endpoint: /fapi/aster/user-deposit (uses API key + HMAC signature with PRIVATE_KEY)
+      this.logger.log(`Depositing $${amount.toFixed(2)} ${asset} to Aster via Treasury contract...`);
+
+      // Aster Treasury contract address on Arbitrum
+      // Transaction: 0xd63c6bce751a8d2230bb574a6571cb160a52f992ab876ba30b21f568a7175bd5
+      const ASTER_TREASURY_CONTRACT = '0x9E36CB86a159d479cEd94Fa05036f235Ac40E1d5';
+      const USDC_CONTRACT_ADDRESS = '0xaf88d065e77c8cC2239327C5EDb3A432268e5831'; // USDC on Arbitrum
       
-      if (!this.wallet || !this.config.userAddress || !this.config.signerAddress) {
+      // Get Arbitrum RPC URL
+      const arbitrumRpcUrl = this.configService.get<string>('ARBITRUM_RPC_URL') ||
+                             this.configService.get<string>('ARB_RPC_URL') ||
+                             'https://arb1.arbitrum.io/rpc'; // Public RPC fallback
+      
+      // Get private key for signing transactions
+      const privateKey = this.configService.get<string>('PRIVATE_KEY') || 
+                        this.configService.get<string>('ASTER_PRIVATE_KEY');
+      if (!privateKey) {
+        throw new Error('PRIVATE_KEY or ASTER_PRIVATE_KEY required for on-chain deposits');
+      }
+
+      const normalizedPrivateKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+      const provider = new ethers.JsonRpcProvider(arbitrumRpcUrl);
+      const wallet = new ethers.Wallet(normalizedPrivateKey, provider);
+
+      this.logger.debug(
+        `Aster deposit details:\n` +
+        `  Treasury contract: ${ASTER_TREASURY_CONTRACT}\n` +
+        `  USDC contract: ${USDC_CONTRACT_ADDRESS}\n` +
+        `  Amount: ${amount} USDC\n` +
+        `  Wallet: ${wallet.address}\n` +
+        `  RPC: ${arbitrumRpcUrl}`
+      );
+
+      // ERC20 ABI for USDC (approve, transfer, allowance, balanceOf, decimals)
+      const erc20Abi = [
+        'function approve(address spender, uint256 amount) external returns (bool)',
+        'function transfer(address to, uint256 amount) external returns (bool)',
+        'function allowance(address owner, address spender) external view returns (uint256)',
+        'function balanceOf(address account) external view returns (uint256)',
+        'function decimals() external view returns (uint8)',
+      ];
+
+      // Aster Treasury contract ABI (deposit function)
+      // Function signature: deposit(address currency, uint256 amount, uint256 broker)
+      const treasuryAbi = [
+        'function deposit(address currency, uint256 amount, uint256 broker) external',
+      ];
+
+      const usdcContract = new ethers.Contract(USDC_CONTRACT_ADDRESS, erc20Abi, wallet);
+      const treasuryContract = new ethers.Contract(ASTER_TREASURY_CONTRACT, treasuryAbi, wallet);
+
+      // Get USDC decimals
+      const decimals = await usdcContract.decimals();
+      const amountWei = ethers.parseUnits(amount.toFixed(decimals), decimals);
+
+      // Check USDC balance
+      const balanceWei = await usdcContract.balanceOf(wallet.address);
+      const balanceFormatted = Number(ethers.formatUnits(balanceWei, decimals));
+      
+      if (balanceFormatted < amount) {
         throw new Error(
-          'Wallet, user address, and signer address required for deposits. ' +
-          'Provide ASTER_USER, ASTER_SIGNER, and ASTER_PRIVATE_KEY.'
+          `Insufficient USDC balance. Required: ${amount.toFixed(2)} USDC, Available: ${balanceFormatted.toFixed(2)} USDC`
         );
       }
 
-      // Aster deposit uses EIP712 signature
-      // Chain ID: 42161 (Arbitrum), 56 (BSC), 1 (Ethereum)
-      // Default to Arbitrum (42161) as that's where most deposits come from
-      const chainId = 42161; // Arbitrum One
-      
-      // Generate nonce (microseconds timestamp as per docs)
-      const nonce = Math.floor(Date.now() * 1000);
-      
-      // Build deposit parameters
-      const depositParams = {
-        asset: asset.toUpperCase(), // USDC, USDT, etc.
-        amount: amount.toString(),
-        chainId: chainId.toString(),
-      };
-
-      // Sign parameters using EIP712 (same as withdrawal)
-      const params = this.signParams(depositParams, nonce);
-
-      // Build query string with signature last
-      const queryParams: string[] = [];
-      const signatureParam: string[] = [];
-      for (const [key, value] of Object.entries(params)) {
-        if (key === 'signature') {
-          signatureParam.push(`${key}=${value}`);
-        } else {
-          queryParams.push(`${key}=${value}`);
-        }
-      }
-      queryParams.sort();
-      const finalQueryString = queryParams.join('&') + (signatureParam.length > 0 ? `&${signatureParam[0]}` : '');
-
-      const headers: Record<string, string> = {};
-      if (this.apiKey) {
-        headers['X-MBX-APIKEY'] = this.apiKey;
+      // Check current allowance
+      const currentAllowance = await usdcContract.allowance(wallet.address, ASTER_TREASURY_CONTRACT);
+      if (currentAllowance < amountWei) {
+        // Approve Treasury contract to spend USDC
+        this.logger.log(`Approving Aster Treasury to spend ${amount.toFixed(2)} USDC...`);
+        const approveTx = await usdcContract.approve(ASTER_TREASURY_CONTRACT, amountWei);
+        await approveTx.wait();
+        this.logger.log(`✅ Approval confirmed: ${approveTx.hash}`);
       }
 
-      this.logger.debug(
-        `Deposit via fapi/aster/user-deposit endpoint: ${this.config.baseUrl}/fapi/aster/user-deposit?${finalQueryString.substring(0, 200)}...`
+      // Call deposit function on Treasury contract
+      // Parameters: currency (USDC address), amount (in wei), broker (1 = default broker)
+      this.logger.log(`Calling deposit function on Aster Treasury contract...`);
+      const depositTx = await treasuryContract.deposit(
+        USDC_CONTRACT_ADDRESS,
+        amountWei,
+        1 // broker ID = 1 (default)
       );
 
-      // Use /fapi/aster/user-deposit endpoint (matches Aster API documentation)
-      const response = await this.client.post(
-        `/fapi/aster/user-deposit?${finalQueryString}`,
-        {},
-        { headers }
-      );
-
-      if (response.data && (response.data.depositId || response.data.id || response.data.tranId)) {
-        const depositId = response.data.depositId || response.data.id || response.data.tranId;
-        this.logger.log(`✅ Deposit successful - Deposit ID: ${depositId}`);
-        return depositId.toString();
+      this.logger.log(`⏳ Deposit transaction submitted: ${depositTx.hash}`);
+      const receipt = await depositTx.wait();
+      
+      if (receipt.status === 1) {
+        this.logger.log(`✅ Deposit successful! Transaction: ${receipt.hash}`);
+        return receipt.hash;
       } else {
-        throw new Error(`Deposit failed: ${JSON.stringify(response.data)}`);
+        throw new Error(`Deposit transaction failed: ${receipt.hash}`);
       }
     } catch (error: any) {
       if (error instanceof ExchangeError) {
         throw error;
       }
+      
       this.logger.error(`Failed to deposit ${asset}: ${error.message}`);
-      if (error.response) {
-        this.logger.debug(`Aster API error response: ${JSON.stringify(error.response.data)}`);
+      if (error.transactionHash) {
+        this.logger.debug(`Transaction hash: ${error.transactionHash}`);
       }
       throw new ExchangeError(
         `Failed to deposit: ${error.message}`,
