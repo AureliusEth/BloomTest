@@ -2429,11 +2429,15 @@ export class FundingArbitrageStrategy {
         }
 
         // Close position by placing opposite order
+        // Use MARKET order with IOC (Immediate or Cancel) and reduceOnly for aggressive closing
         const closeOrder = new PerpOrderRequest(
           position.symbol,
           position.side === OrderSide.LONG ? OrderSide.SHORT : OrderSide.LONG,
           OrderType.MARKET,
-          position.size,
+          Math.abs(position.size), // Use absolute size
+          0, // No limit price for market orders
+          TimeInForce.IOC, // Immediate or cancel - ensures aggressive fill
+          true, // Reduce only - ensures we're closing, not opening
         );
 
         this.logger.log(
@@ -2494,20 +2498,94 @@ export class FundingArbitrageStrategy {
           );
           closed.push(position);
         } else {
+          // Final fallback: if position still exists after all retries, try one more market order
           if (positionStillExists) {
             this.logger.warn(
               `⚠️ Position ${position.symbol} on ${position.exchangeType} still exists after close attempt. ` +
-                `Margin remains locked. Will account for this in balance calculations.`,
+                `Attempting final market order fallback...`,
             );
+
+            try {
+              // Get current position size (may have changed)
+              const currentPositions = await adapter.getPositions();
+              const currentPosition = currentPositions.find(
+                (p) =>
+                  p.symbol === position.symbol &&
+                  p.exchangeType === position.exchangeType &&
+                  Math.abs(p.size) > 0.0001,
+              );
+
+              if (currentPosition) {
+                const finalCloseOrder = new PerpOrderRequest(
+                  currentPosition.symbol,
+                  currentPosition.side === OrderSide.LONG
+                    ? OrderSide.SHORT
+                    : OrderSide.LONG,
+                  OrderType.MARKET,
+                  Math.abs(currentPosition.size), // Use absolute size
+                  0, // No limit price for market orders
+                  TimeInForce.IOC, // Immediate or cancel
+                  true, // Reduce only
+                );
+
+                this.logger.log(
+                  `🔄 Final fallback: Force closing ${currentPosition.symbol} ${currentPosition.side} ${Math.abs(currentPosition.size).toFixed(4)} on ${currentPosition.exchangeType} with market order...`,
+                );
+
+                const fallbackResponse = await adapter.placeOrder(finalCloseOrder);
+
+                // Wait a bit for the order to fill
+                await new Promise((resolve) => setTimeout(resolve, 2000));
+
+                // Verify position is closed
+                const verifyPositions = await adapter.getPositions();
+                const stillExists = verifyPositions.some(
+                  (p) =>
+                    p.symbol === position.symbol &&
+                    p.exchangeType === position.exchangeType &&
+                    Math.abs(p.size) > 0.0001,
+                );
+
+                if (!stillExists && fallbackResponse.isSuccess()) {
+                  this.logger.log(
+                    `✅ Successfully closed position with final fallback market order: ${position.symbol} on ${position.exchangeType}`,
+                  );
+                  closed.push(position);
+                } else {
+                  this.logger.error(
+                    `❌ Final fallback market order failed: ${position.symbol} on ${position.exchangeType}. ` +
+                      `Position still exists. Margin remains locked.`,
+                  );
+                  result.errors.push(
+                    `Failed to close position ${position.symbol} on ${position.exchangeType} even after final fallback`,
+                  );
+                  stillOpen.push(position);
+                }
+              } else {
+                // Position disappeared between checks
+                this.logger.log(
+                  `✅ Position ${position.symbol} on ${position.exchangeType} closed (disappeared during fallback check)`,
+                );
+                closed.push(position);
+              }
+            } catch (fallbackError: any) {
+              this.logger.error(
+                `❌ Final fallback market order error for ${position.symbol} on ${position.exchangeType}: ${fallbackError.message}`,
+              );
+              result.errors.push(
+                `Failed to close position ${position.symbol} on ${position.exchangeType}: ${fallbackError.message}`,
+              );
+              stillOpen.push(position);
+            }
           } else {
             this.logger.warn(
               `⚠️ Failed to close position ${position.symbol} on ${position.exchangeType}: ${finalResponse.error || 'order not filled'}`,
             );
+            result.errors.push(
+              `Failed to close position ${position.symbol} on ${position.exchangeType}`,
+            );
+            stillOpen.push(position);
           }
-          result.errors.push(
-            `Failed to close position ${position.symbol} on ${position.exchangeType}`,
-          );
-          stillOpen.push(position);
         }
 
         // Small delay between closes to avoid rate limits
