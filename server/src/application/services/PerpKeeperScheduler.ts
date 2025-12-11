@@ -51,12 +51,24 @@ export class PerpKeeperScheduler implements OnModuleInit {
 
     const blacklistEnv = this.configService.get<string>('KEEPER_BLACKLISTED_SYMBOLS');
     if (blacklistEnv) {
-      this.blacklistedSymbols = new Set(
-        blacklistEnv.split(',').map(s => normalizeSymbol(s))
-      );
+      // Split by comma and filter out empty strings, then normalize
+      const blacklistArray = blacklistEnv
+        .split(',')
+        .map(s => s.trim())
+        .filter(s => s.length > 0)
+        .map(s => normalizeSymbol(s));
+      
+      this.blacklistedSymbols = new Set(blacklistArray);
       this.logger.log(
-        `Blacklisted symbols: ${Array.from(this.blacklistedSymbols).join(', ')}`
+        `✅ Blacklisted symbols loaded: ${Array.from(this.blacklistedSymbols).join(', ')} (from env: "${blacklistEnv}")`
       );
+      
+      // Debug: Log if NVDA should be blacklisted
+      if (this.blacklistedSymbols.has('NVDA')) {
+        this.logger.log(`✅ NVDA is in blacklist - will be filtered`);
+      } else {
+        this.logger.warn(`⚠️ NVDA is NOT in blacklist! Current blacklist: ${Array.from(this.blacklistedSymbols).join(', ')}`);
+      }
     } else {
       // Default blacklist: NVDA (experimental market)
       this.blacklistedSymbols = new Set(['NVDA']);
@@ -291,6 +303,16 @@ export class PerpKeeperScheduler implements OnModuleInit {
         this.logger.warn(
           `⚠️ Filtered out ${filtered.length} opportunities for blacklisted symbols: ${filteredSymbolsList.join(', ')}`
         );
+        // Debug: Log blacklist status
+        this.logger.log(
+          `🔍 Blacklist check: Current blacklist contains: ${Array.from(this.blacklistedSymbols).join(', ')}`
+        );
+        filteredSymbolsList.forEach(symbol => {
+          const normalized = this.normalizeSymbolForBlacklist(symbol);
+          this.logger.log(
+            `🔍 Symbol "${symbol}" normalized to "${normalized}", blacklisted: ${this.blacklistedSymbols.has(normalized)}`
+          );
+        });
       }
 
       this.logger.log(`Found ${filteredOpportunities.length} arbitrage opportunities (after blacklist filter)`);
