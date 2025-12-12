@@ -429,6 +429,7 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
             }
             
             // Use createUnifiedOrder with MARKET order type (per Lighter docs)
+            // For opening market orders: orderExpiry = 0 (consistent with limit orders)
             orderParams = {
               marketIndex,
               clientOrderIndex: Date.now(),
@@ -437,6 +438,7 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
               orderType: LighterOrderType.MARKET,
               idealPrice: market.priceToUnits(idealPrice),
               maxSlippage: 0.01, // 1% max slippage
+              orderExpiry: 0, // 0 for opening orders (consistent with limit orders)
             };
           }
         } else {
@@ -451,10 +453,13 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
             ? Date.now() + 60000  // 1 minute for IOC orders
             : Date.now() + 3600000; // 1 hour for GTC orders
 
-          // orderExpiry: Must be a future timestamp > expiredAt
-          // Based on testing: orderExpiry must be significantly greater than expiredAt
-          // Set to expiredAt + 1 hour to ensure it's always valid for both IOC and GTC
-          const orderExpiry = expiredAt + 3600000; // Always 1 hour after expiredAt
+          // orderExpiry: Based on testing with lighter-open-position-test.ts
+          // For opening orders (reduceOnly = false): orderExpiry = 0 works
+          // For closing orders (reduceOnly = true): Keep existing logic (expiredAt + 1 hour)
+          // This matches the behavior found in testing
+          const orderExpiry = request.reduceOnly 
+            ? expiredAt + 3600000  // Closing orders: 1 hour after expiredAt
+            : 0;                    // Opening orders: 0
           
           orderParams = {
             marketIndex,
@@ -465,7 +470,7 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
             orderType: LighterOrderType.LIMIT,
             timeInForce, // 0 = GTC, 1 = IOC
             reduceOnly: request.reduceOnly ? 1 : 0, // Critical: must be 1 for closing orders
-            orderExpiry, // Future timestamp (1 hour) - must be > expiredAt
+            orderExpiry, // 0 for opening orders, expiredAt + 1 hour for closing orders
             expiredAt,
           };
         }
