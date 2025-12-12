@@ -505,12 +505,45 @@ export class HyperliquidExchangeAdapter implements IPerpExchangeAdapter {
 
   async cancelOrder(orderId: string, symbol?: string): Promise<boolean> {
     try {
-      // Hyperliquid SDK doesn't have cancelOrder method on ExchangeClient
-      // We need to use the order method with cancel action
-      // For now, log a warning and return false
-      this.logger.warn('Cancel order not yet implemented for Hyperliquid - SDK limitation');
-      // TODO: Implement cancel using order method with cancel action if SDK supports it
-      return false;
+      await this.ensureSymbolConverter();
+      
+      if (!symbol) {
+        throw new Error('Symbol is required for canceling orders on Hyperliquid');
+      }
+
+      // Get asset index from symbol
+      const baseCoin = symbol.replace('USDT', '').replace('USDC', '').replace('-PERP', '');
+      const assetId = this.symbolConverter!.getAssetId(baseCoin);
+      
+      if (assetId === undefined) {
+        throw new Error(`Could not find asset ID for "${baseCoin}"`);
+      }
+
+      // Convert orderId to number (Hyperliquid uses numeric order IDs)
+      const orderIdNum = parseInt(orderId, 10);
+      if (isNaN(orderIdNum)) {
+        throw new Error(`Invalid order ID format: ${orderId}`);
+      }
+
+      this.logger.debug(`Cancelling order ${orderId} for ${symbol} (asset index: ${assetId})`);
+
+      // Hyperliquid uses the order() method with cancels parameter for cancellation
+      const result = await this.exchangeClient.order({
+        cancels: [
+          {
+            a: assetId,      // Asset index
+            o: orderIdNum,   // Order ID
+          },
+        ],
+      });
+
+      if (result.status === 'ok') {
+        this.logger.log(`✅ Order ${orderId} cancelled successfully on Hyperliquid`);
+        return true;
+      } else {
+        this.logger.warn(`Failed to cancel order ${orderId}: ${JSON.stringify(result)}`);
+        return false;
+      }
     } catch (error: any) {
       this.logger.error(`Failed to cancel order: ${error.message}`);
       throw new ExchangeError(
@@ -524,12 +557,53 @@ export class HyperliquidExchangeAdapter implements IPerpExchangeAdapter {
 
   async cancelAllOrders(symbol: string): Promise<number> {
     try {
-      // Hyperliquid SDK doesn't have cancelAllOrders method on ExchangeClient
-      // We need to use the order method with cancel action
-      // For now, log a warning and return 0
-      this.logger.warn('Cancel all orders not yet implemented for Hyperliquid - SDK limitation');
-      // TODO: Implement cancel all using order method with cancel action if SDK supports it
-      return 0;
+      await this.ensureSymbolConverter();
+      
+      // Get asset index from symbol
+      const baseCoin = symbol.replace('USDT', '').replace('USDC', '').replace('-PERP', '');
+      const assetId = this.symbolConverter!.getAssetId(baseCoin);
+      
+      if (assetId === undefined) {
+        throw new Error(`Could not find asset ID for "${baseCoin}"`);
+      }
+
+      this.logger.debug(`Cancelling all orders for ${symbol} (asset index: ${assetId})`);
+
+      // Fetch open orders first
+      const openOrders = await this.infoClient.openOrders({ user: this.walletAddress });
+      
+      // Filter orders for this specific asset
+      const ordersToCancel = openOrders.filter((o: any) => {
+        // Check if order matches the asset index
+        return o.asset === assetId || o.coin === baseCoin;
+      });
+
+      if (ordersToCancel.length === 0) {
+        this.logger.debug(`No open orders found for ${symbol}`);
+        return 0;
+      }
+
+      // Cancel all orders for this asset
+      const cancels = ordersToCancel.map((o: any) => {
+        const orderId = typeof o.oid === 'bigint' ? Number(o.oid) : parseInt(String(o.oid || '0'), 10);
+        return {
+          a: assetId,
+          o: orderId,
+        };
+      });
+
+      // Hyperliquid uses the order() method with cancels parameter for cancellation
+      const result = await this.exchangeClient.order({
+        cancels,
+      });
+
+      if (result.status === 'ok') {
+        this.logger.log(`✅ Cancelled ${cancels.length} order(s) for ${symbol} on Hyperliquid`);
+        return cancels.length;
+      } else {
+        this.logger.warn(`Failed to cancel all orders for ${symbol}: ${JSON.stringify(result)}`);
+        return 0;
+      }
     } catch (error: any) {
       this.logger.error(`Failed to cancel all orders: ${error.message}`);
       throw new ExchangeError(

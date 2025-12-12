@@ -147,7 +147,7 @@ export class StrategyConfig {
       exchangeFeeRates,
       takerFeeRates,
       Percentage.fromDecimal(0.0001), // limitOrderPriceImprovement
-      2 * 60 * 1000, // asymmetricFillTimeoutMs (2 minutes)
+      30 * 1000, // asymmetricFillTimeoutMs (30 seconds - reduced from 2 minutes for faster response)
       3, // maxExecutionRetries
       [5000, 10000], // executionRetryDelays
       10, // maxOrderWaitRetries
@@ -158,3 +158,6 @@ export class StrategyConfig {
     );
   }
 }
+
+
+

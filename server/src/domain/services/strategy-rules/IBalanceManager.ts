@@ -20,3 +20,6 @@ export interface IBalanceManager {
     shortBalance: number,
   ): Promise<Result<boolean, DomainException>>;
 }
+
+
+

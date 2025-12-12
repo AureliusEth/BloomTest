@@ -51,3 +51,5 @@ export interface IOpportunityEvaluator {
     newBreakEvenHours: number | null;
   }, DomainException>>;
 }
+
+

@@ -116,6 +116,15 @@ export class FundingArbitrageStrategy {
   // Filtered opportunities: opportunities that failed after 5 retries
   private readonly filteredOpportunities: Set<string> = new Set(); // key: `${symbol}-${longExchange}-${shortExchange}`
 
+  // Failed orders tracking: orders that have exhausted retries
+  private readonly failedOrders: Map<
+    ExchangeType,
+    Array<{ orderId: string; symbol: string; timestamp: Date }>
+  > = new Map();
+
+  // Open orders tracking: orders that are still pending
+  private readonly openOrders: Map<ExchangeType, string[]> = new Map();
+
   // Leverage multiplier (from StrategyConfig, kept for convenience)
   private readonly leverage: number;
 
@@ -141,6 +150,8 @@ export class FundingArbitrageStrategy {
     private readonly performanceLogger?: IPerpKeeperPerformanceLogger,
     @Optional() private readonly balanceRebalancer?: ExchangeBalanceRebalancer,
     @Optional() private readonly eventBus?: IEventBus,
+    @Optional()
+    private readonly idleFundsManager?: any, // IIdleFundsManager - using any to avoid circular dependency
   ) {
     // Use leverage from StrategyConfig
     // Leverage improves net returns: 2x leverage = 2x funding returns, but fees stay same %
@@ -1588,6 +1599,56 @@ export class FundingArbitrageStrategy {
       // Strategy is successful if it completes execution, even with some errors
       // Only mark as failed if there's a fatal error in the outer catch block
       result.success = true;
+
+      // Handle idle funds: detect and reallocate to best opportunities
+      if (this.idleFundsManager) {
+        try {
+          const currentPositions = await this.getAllPositions(adapters);
+          const allOpportunities = await this.aggregator.findArbitrageOpportunities(
+            symbols,
+            minSpread || this.strategyConfig.defaultMinSpread.toDecimal(),
+          );
+
+          // Detect idle funds
+          const idleFundsResult = await this.idleFundsManager.detectIdleFunds(
+            adapters,
+            currentPositions,
+            this.openOrders,
+            this.failedOrders,
+          );
+
+          if (idleFundsResult.isSuccess && idleFundsResult.value.length > 0) {
+            // Allocate idle funds to best opportunities
+            const allocationResult = this.idleFundsManager.allocateIdleFunds(
+              idleFundsResult.value,
+              allOpportunities,
+              currentPositions,
+              exchangeBalances,
+            );
+
+            if (allocationResult.isSuccess && allocationResult.value.length > 0) {
+              // Execute allocations
+              const executionResult = await this.idleFundsManager.executeAllocations(
+                allocationResult.value,
+                adapters,
+              );
+
+              if (executionResult.isSuccess) {
+                this.logger.log(
+                  `✅ Idle funds handling: Allocated $${executionResult.value.allocated.toFixed(2)} ` +
+                    `across ${executionResult.value.allocations} allocation(s)`,
+                );
+              } else {
+                this.logger.warn(
+                  `Failed to execute idle funds allocations: ${executionResult.error.message}`,
+                );
+              }
+            }
+          }
+        } catch (error: any) {
+          this.logger.warn(`Error handling idle funds: ${error.message}`);
+        }
+      }
     } catch (error: any) {
       result.success = false;
       result.errors.push(`Strategy execution failed: ${error.message}`);

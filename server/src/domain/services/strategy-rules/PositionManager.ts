@@ -365,15 +365,20 @@ export class PositionManager implements IPositionManager {
     adapters: Map<ExchangeType, IPerpExchangeAdapter>,
     fills: AsymmetricFill[],
     result: ArbitrageExecutionResult,
+    immediate: boolean = false,
   ): Promise<Result<void, DomainException>> {
     const now = new Date();
     const fillsToHandle: Array<{ fill: AsymmetricFill }> = [];
 
-    // Filter fills that exceeded timeout
+    // Filter fills: immediate mode handles all, otherwise only those exceeding timeout
     for (const fill of fills) {
-      const ageMs = now.getTime() - fill.timestamp.getTime();
-      if (ageMs >= this.config.asymmetricFillTimeoutMs) {
+      if (immediate) {
         fillsToHandle.push({ fill });
+      } else {
+        const ageMs = now.getTime() - fill.timestamp.getTime();
+        if (ageMs >= this.config.asymmetricFillTimeoutMs) {
+          fillsToHandle.push({ fill });
+        }
       }
     }
 
@@ -381,9 +386,15 @@ export class PositionManager implements IPositionManager {
       return Result.success(undefined);
     }
 
-    this.logger.warn(
-      `⚠️ Handling ${fillsToHandle.length} asymmetric fill(s) that exceeded timeout...`,
-    );
+    if (immediate) {
+      this.logger.warn(
+        `⚡ Handling ${fillsToHandle.length} asymmetric fill(s) immediately (no timeout)...`,
+      );
+    } else {
+      this.logger.warn(
+        `⚠️ Handling ${fillsToHandle.length} asymmetric fill(s) that exceeded timeout...`,
+      );
+    }
 
     for (const { fill } of fillsToHandle) {
       try {
@@ -433,58 +444,159 @@ export class PositionManager implements IPositionManager {
         );
 
         if (profitability.profitable) {
-          // Option 2: Cancel GTC order and place market order to complete arbitrage
+          // Option 2: Try progressive price improvement, then market order if needed
           this.logger.log(
             `📋 ${symbol}: Arbitrage still profitable with taker fees ` +
               `($${profitability.expectedNetReturn.toFixed(4)}/period). ` +
-              `Cancelling GTC order and placing market order to complete pair...`,
+              `Attempting progressive price improvement before market order...`,
           );
 
-          // Cancel unfilled GTC order
+          // Progressive price improvements: try worse prices to get filled faster
+          const priceImprovements = [0.001, 0.002, 0.005]; // 0.1%, 0.2%, 0.5% worse
+          let improvedOrderFilled = false;
+          const unfilledSide = longFilled ? OrderSide.SHORT : OrderSide.LONG;
+          
+          // Get current mark price for the unfilled exchange
+          let currentMarkPrice: number;
+          try {
+            currentMarkPrice = await unfilledAdapter.getMarkPrice(symbol);
+          } catch (error: any) {
+            this.logger.warn(
+              `Failed to get mark price for ${symbol} on ${unfilledExchange}: ${error.message}. ` +
+              `Skipping price improvement, going straight to market order.`,
+            );
+            currentMarkPrice = markPrice; // Fallback to opportunity mark price
+          }
+
+          // Try progressive price improvement if order still exists
+          // This helps fill orders faster in both immediate and timeout-based handling
           if (unfilledOrderId) {
-            try {
-              await unfilledAdapter.cancelOrder(unfilledOrderId, symbol);
-              this.logger.log(
-                `✅ Cancelled GTC order ${unfilledOrderId} on ${unfilledExchange}`,
-              );
-            } catch (error: any) {
-              this.logger.warn(
-                `Failed to cancel GTC order ${unfilledOrderId}: ${error.message}`,
-              );
+            for (let i = 0; i < priceImprovements.length && !improvedOrderFilled; i++) {
+              const improvement = priceImprovements[i];
+              
+              // Calculate improved price (worse = more aggressive)
+              // For LONG: improve by making price higher (pay more)
+              // For SHORT: improve by making price lower (sell for less)
+              const improvedPrice = unfilledSide === OrderSide.LONG
+                ? currentMarkPrice * (1 + improvement)  // Pay more for LONG
+                : currentMarkPrice * (1 - improvement);  // Sell for less for SHORT
+
+              try {
+                // Cancel existing order
+                await unfilledAdapter.cancelOrder(unfilledOrderId, symbol);
+                this.logger.debug(
+                  `🔄 ${symbol}: Cancelled order ${unfilledOrderId}, replacing with improved price ` +
+                  `${improvedPrice.toFixed(4)} (${(improvement * 100).toFixed(2)}% ${unfilledSide === OrderSide.LONG ? 'worse' : 'worse'})`,
+                );
+
+                // Place new limit order with improved price
+                const improvedOrder = new PerpOrderRequest(
+                  symbol,
+                  unfilledSide,
+                  OrderType.LIMIT,
+                  positionSize,
+                  improvedPrice,
+                  TimeInForce.IOC, // Use IOC for faster execution
+                );
+
+                const improvedResponse = await unfilledAdapter.placeOrder(improvedOrder);
+
+                if (improvedResponse.isSuccess() && improvedResponse.isFilled()) {
+                  this.logger.log(
+                    `✅ ${symbol}: Improved limit order filled at ${improvedPrice.toFixed(4)}. ` +
+                    `Arbitrage pair complete. Net return: $${profitability.expectedNetReturn.toFixed(4)}/period`,
+                  );
+                  improvedOrderFilled = true;
+                  break;
+                } else if (improvedResponse.isSuccess() && improvedResponse.status === OrderStatus.SUBMITTED) {
+                  // Order placed but not filled - wait briefly then check
+                  this.logger.debug(
+                    `⏳ ${symbol}: Improved order placed but not immediately filled. Waiting 3 seconds...`,
+                  );
+                  await new Promise(resolve => setTimeout(resolve, 3000));
+                  
+                  // Check if order filled
+                  try {
+                    const orderStatus = await unfilledAdapter.getOrderStatus(
+                      improvedResponse.orderId,
+                      symbol,
+                    );
+                    if (orderStatus.isFilled()) {
+                      this.logger.log(
+                        `✅ ${symbol}: Improved limit order filled after wait. Arbitrage pair complete.`,
+                      );
+                      improvedOrderFilled = true;
+                      break;
+                    }
+                    // Cancel the improved order if it didn't fill
+                    await unfilledAdapter.cancelOrder(improvedResponse.orderId, symbol);
+                  } catch (statusError: any) {
+                    this.logger.debug(
+                      `Could not check order status: ${statusError.message}. Continuing to next improvement.`,
+                    );
+                  }
+                }
+              } catch (error: any) {
+                this.logger.warn(
+                  `Failed price improvement attempt ${i + 1}/${priceImprovements.length} for ${symbol}: ${error.message}`,
+                );
+                // Continue to next improvement or market order
+              }
             }
           }
 
-          // Place market order to complete the pair
-          const marketOrder = new PerpOrderRequest(
-            symbol,
-            longFilled ? OrderSide.SHORT : OrderSide.LONG,
-            OrderType.MARKET,
-            positionSize,
-          );
+          // If price improvement didn't work, place market order
+          if (!improvedOrderFilled) {
+            // Cancel unfilled GTC order if it still exists
+            if (unfilledOrderId) {
+              try {
+                await unfilledAdapter.cancelOrder(unfilledOrderId, symbol);
+                this.logger.log(
+                  `✅ Cancelled GTC order ${unfilledOrderId} on ${unfilledExchange}`,
+                );
+              } catch (error: any) {
+                // Order might already be cancelled or filled
+                this.logger.debug(
+                  `Could not cancel order ${unfilledOrderId}: ${error.message}`,
+                );
+              }
+            }
 
-          const marketResponse = await unfilledAdapter.placeOrder(marketOrder);
-
-          if (marketResponse.isSuccess() && marketResponse.isFilled()) {
+            // Place market order to complete the pair
             this.logger.log(
-              `✅ ${symbol}: Market order filled, arbitrage pair complete. ` +
-                `Net return: $${profitability.expectedNetReturn.toFixed(4)}/period`,
+              `📤 ${symbol}: Placing market order to complete arbitrage pair...`,
             );
-          } else {
-            this.logger.warn(
-              `⚠️ ${symbol}: Market order failed to fill. ` +
-                `Falling back to closing filled position...`,
-            );
-            // Fall through to Option 1
-            const closeResult = await this.closeFilledPosition(
-              filledAdapter,
+            const marketOrder = new PerpOrderRequest(
               symbol,
-              filledSide,
+              unfilledSide,
+              OrderType.MARKET,
               positionSize,
-              filledExchange,
-              result,
             );
-            if (closeResult.isFailure) {
-              // Error already logged in closeFilledPosition
+
+            const marketResponse = await unfilledAdapter.placeOrder(marketOrder);
+
+            if (marketResponse.isSuccess() && marketResponse.isFilled()) {
+              this.logger.log(
+                `✅ ${symbol}: Market order filled, arbitrage pair complete. ` +
+                  `Net return: $${profitability.expectedNetReturn.toFixed(4)}/period`,
+              );
+            } else {
+              this.logger.warn(
+                `⚠️ ${symbol}: Market order failed to fill. ` +
+                  `Falling back to closing filled position...`,
+              );
+              // Fall through to Option 1
+              const closeResult = await this.closeFilledPosition(
+                filledAdapter,
+                symbol,
+                filledSide,
+                positionSize,
+                filledExchange,
+                result,
+              );
+              if (closeResult.isFailure) {
+                // Error already logged in closeFilledPosition
+              }
             }
           }
         } else {

@@ -35,6 +35,7 @@ export interface IPositionManager {
     adapters: Map<ExchangeType, IPerpExchangeAdapter>,
     fills: AsymmetricFill[],
     result: ArbitrageExecutionResult,
+    immediate?: boolean,
   ): Promise<Result<void, DomainException>>;
 
   closeFilledPosition(

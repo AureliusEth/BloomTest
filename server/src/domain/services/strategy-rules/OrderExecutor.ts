@@ -432,7 +432,8 @@ export class OrderExecutor implements IOrderExecutor {
               (shortFullyFilled && longOnBook);
 
             if (asymmetricFill) {
-              // Handle asymmetric fill via position manager
+              // Handle asymmetric fill immediately via position manager
+              // Immediate handling reduces exposure time from 2 minutes to seconds
               const fill: AsymmetricFill = {
                 symbol: opportunity.symbol,
                 longFilled: longFullyFilled,
@@ -445,7 +446,7 @@ export class OrderExecutor implements IOrderExecutor {
                 opportunity,
                 timestamp: new Date(),
               };
-              await this.positionManager.handleAsymmetricFills(adapters, [fill], result);
+              await this.positionManager.handleAsymmetricFills(adapters, [fill], result, true); // immediate=true
             }
 
             successfulExecutions++;
