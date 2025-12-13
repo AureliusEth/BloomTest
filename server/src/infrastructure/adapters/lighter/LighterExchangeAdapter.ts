@@ -448,11 +448,10 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
             throw new Error('Limit price is required for LIMIT orders');
           }
 
-          // Map TimeInForce: IOC = 1, GTC = 0
-          const timeInForce = request.timeInForce === TimeInForce.IOC ? 1 : 0;
-          const expiredAt = timeInForce === 1 
-            ? Date.now() + 60000  // 1 minute for IOC orders
-            : Date.now() + 3600000; // 1 hour for GTC orders
+          // LIMIT orders always use GTC (Good Till Cancel) - they can sit on the order book
+          // Only MARKET orders use IOC (Immediate Or Cancel) for immediate execution
+          const timeInForce = 0; // Always GTC for LIMIT orders
+          const expiredAt = Date.now() + 3600000; // 1 hour expiry for GTC orders
 
           // orderExpiry: Based on testing with lighter-open-position-test.ts
           // For opening orders (reduceOnly = false): orderExpiry = 0 works
