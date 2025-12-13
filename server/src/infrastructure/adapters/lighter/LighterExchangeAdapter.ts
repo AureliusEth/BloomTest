@@ -61,7 +61,7 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
       apiKeyIndex,
     );
 
-    this.logger.log(`Lighter adapter initialized for account index: ${accountIndex}`);
+    // Removed adapter initialization log - only execution logs shown
   }
 
   private async ensureInitialized(): Promise<void> {
@@ -120,7 +120,8 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
                              errorMsg.includes('rate limit');
           
           if (isRateLimit && attempt < maxRetries - 1) {
-            this.logger.warn(
+            // Silenced 429/rate limit warnings - only show errors
+            this.logger.debug(
               `Market config fetch rate limited for market ${marketIndex} ` +
               `(attempt ${attempt + 1}/${maxRetries}): ${errorMsg}. Will retry.`
             );
@@ -188,7 +189,7 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
       }
 
       this.marketIndexCacheTimestamp = now;
-      this.logger.log(`Cached ${this.marketIndexCache.size} market index mappings from Lighter Explorer API`);
+      // Removed cache log - only execution logs shown
     } catch (error: any) {
       this.logger.warn(`Failed to fetch market index mappings from Explorer API: ${error.message}`);
       // Don't throw - allow fallback to hardcoded mapping
@@ -585,7 +586,8 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
                                  errorMsg.includes('margin mode');
         
         if (isRateLimit && attempt < maxRetries - 1) {
-          this.logger.warn(
+          // Silenced 429/rate limit warnings - only show errors
+          this.logger.debug(
             `Order placement rate limited for ${request.symbol} ` +
             `(attempt ${attempt + 1}/${maxRetries}): ${errorMsg}. Will retry.`
           );
@@ -1085,7 +1087,8 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
           // If it's a 429 (rate limit), retry with improved backoff
           if (statusCode === 429 && attempt < maxRetries - 1) {
             lastError = `Candlesticks API: Rate limited (429), will retry`;
-            this.logger.warn(
+            // Silenced 429 warnings - only show errors
+            this.logger.debug(
               `Candlesticks method rate limited for ${symbol} (attempt ${attempt + 1}/${maxRetries}): ${errorMsg}. ` +
               `Will retry with exponential backoff.`
             );
@@ -1458,7 +1461,8 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
         
         // If it's a 429 (rate limit), retry with improved backoff
         if (statusCode === 429 && attempt < maxRetries - 1) {
-          this.logger.warn(
+          // Silenced 429 warnings - only show errors
+          this.logger.debug(
             `Lighter balance query rate limited (attempt ${attempt + 1}/${maxRetries}): ${errorMsg}. ` +
             `Will retry with exponential backoff.`
           );
@@ -1649,19 +1653,13 @@ export class LighterExchangeAdapter implements IPerpExchangeAdapter {
         
         // Check if we have sufficient balance
         if (balanceFormatted >= amount) {
-          this.logger.log(
-            `✅ Funds arrived. Available balance: ${balanceFormatted.toFixed(2)} USDC`
-          );
+          // Removed funds arrival log - only execution/order logs shown
           break;
         }
         
         // Accept balance within tolerance (handles withdrawal fees)
         if (balanceFormatted >= minAcceptableAmount && balanceFormatted > 0) {
-          this.logger.log(
-            `✅ Funds arrived (within tolerance). Available balance: ${balanceFormatted.toFixed(2)} USDC ` +
-            `(requested: ${amount.toFixed(2)} USDC, tolerance: ${tolerance.toFixed(2)} USDC). ` +
-            `This likely accounts for withdrawal fees.`
-          );
+          // Removed funds arrival log - only execution/order logs shown
           break;
         }
         

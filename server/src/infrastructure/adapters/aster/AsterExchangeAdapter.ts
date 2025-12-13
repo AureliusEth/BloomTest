@@ -88,9 +88,9 @@ export class AsterExchangeAdapter implements IPerpExchangeAdapter {
     });
 
     if (user) {
-      this.logger.log(`Aster adapter initialized for user: ${user} (trading enabled)`);
+      // Removed adapter initialization log - only execution logs shown
     } else if (apiKey) {
-      this.logger.log(`Aster adapter initialized with API key (read-only mode)`);
+      // Removed adapter initialization log - only execution logs shown
     }
   }
 
@@ -1544,10 +1544,18 @@ export class AsterExchangeAdapter implements IPerpExchangeAdapter {
               ? 30000 * attempt // 30s, 60s, 90s for rate limits
               : retryDelay * attempt; // 2s, 4s, 6s for other errors
             
-            this.logger.warn(
-              `Withdrawal attempt ${attempt}/${maxRetries} failed with retryable error ` +
-              `(${errorCode}: ${errorMsg}). Retrying in ${delay}ms...`
-            );
+            // Silenced rate limit warnings - only show errors
+            if (isRateLimit || isMultiChainLimit) {
+              this.logger.debug(
+                `Withdrawal attempt ${attempt}/${maxRetries} failed with retryable error ` +
+                `(${errorCode}: ${errorMsg}). Retrying in ${delay}ms...`
+              );
+            } else {
+              this.logger.warn(
+                `Withdrawal attempt ${attempt}/${maxRetries} failed with retryable error ` +
+                `(${errorCode}: ${errorMsg}). Retrying in ${delay}ms...`
+              );
+            }
             await new Promise(resolve => setTimeout(resolve, delay));
             continue;
           } else {

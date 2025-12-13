@@ -157,9 +157,7 @@ export class FundingArbitrageStrategy {
     // Leverage improves net returns: 2x leverage = 2x funding returns, but fees stay same %
     // Example: $100 capital, 2x leverage = $200 notional, 10% APY = $20/year vs $10/year (2x improvement)
     this.leverage = this.strategyConfig.leverage;
-    this.logger.log(
-      `Funding arbitrage strategy initialized with ${this.leverage}x leverage`,
-    );
+    // Removed strategy initialization log - only execution logs shown
   }
 
   /**

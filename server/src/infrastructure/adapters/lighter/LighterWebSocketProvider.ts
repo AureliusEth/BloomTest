@@ -68,13 +68,13 @@ export class LighterWebSocketProvider implements OnModuleInit, OnModuleDestroy {
   private async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
-        this.logger.log('Connecting to Lighter WebSocket...');
+        // Removed WebSocket connection log - only execution logs shown
         this.ws = new WebSocket(this.WS_URL);
 
         this.ws.on('open', () => {
           this.isConnected = true;
           this.reconnectAttempts = 0;
-          this.logger.log('✅ Connected to Lighter WebSocket');
+          // Removed WebSocket connection log - only execution logs shown
           
           // Resubscribe to all markets we were tracking
           // Use setTimeout to ensure subscriptions happen after connection is fully established
@@ -122,7 +122,7 @@ export class LighterWebSocketProvider implements OnModuleInit, OnModuleDestroy {
 
         this.ws.on('close', () => {
           this.isConnected = false;
-          this.logger.warn('Lighter WebSocket connection closed');
+          // Removed WebSocket connection log - only execution logs shown
           
           // Attempt to reconnect
           if (this.reconnectAttempts < this.MAX_RECONNECT_ATTEMPTS) {
@@ -148,7 +148,7 @@ export class LighterWebSocketProvider implements OnModuleInit, OnModuleDestroy {
       this.ws.close();
       this.ws = null;
       this.isConnected = false;
-      this.logger.log('Disconnected from Lighter WebSocket');
+      // Removed WebSocket disconnection log - only execution logs shown
     }
   }
 
@@ -294,7 +294,7 @@ export class LighterWebSocketProvider implements OnModuleInit, OnModuleDestroy {
       // Subscribe to all markets that don't have data yet
       const marketsToSubscribe = marketIndexes.filter(index => !this.hasMarketData(index));
       if (marketsToSubscribe.length > 0) {
-        this.logger.log(`📡 LIGHTER: Subscribing to ${marketsToSubscribe.length} markets via subscribeToMarkets (websocket connected)`);
+        // Removed WebSocket subscription log - only execution logs shown
         marketsToSubscribe.forEach(index => {
           // Force subscribe to ensure message is sent
           this.subscribeToMarket(index, true);

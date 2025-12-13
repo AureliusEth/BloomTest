@@ -78,7 +78,7 @@ export class HyperliquidExchangeAdapter implements IPerpExchangeAdapter {
     // Don't initialize symbol converter in constructor - initialize lazily when needed
     // This prevents rate limiting during startup
 
-    this.logger.log(`Hyperliquid adapter initialized for wallet: ${this.walletAddress}`);
+    // Removed adapter initialization log - only execution logs shown
   }
 
   /**
@@ -108,7 +108,8 @@ export class HyperliquidExchangeAdapter implements IPerpExchangeAdapter {
         if (isRateLimit && attempt < maxRetries - 1) {
           // Exponential backoff: 1s, 2s, 4s, 8s, 16s
           const delay = baseDelay * Math.pow(2, attempt);
-          this.logger.warn(
+          // Silenced 429 warnings - only show errors
+          this.logger.debug(
             `Rate limit hit (429) when initializing SymbolConverter. ` +
             `Retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries})`
           );

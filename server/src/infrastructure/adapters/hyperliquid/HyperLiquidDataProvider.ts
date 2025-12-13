@@ -273,7 +273,8 @@ export class HyperLiquidDataProvider implements IFundingDataProvider, OnModuleIn
       // Retry on 429 errors with exponential backoff
       if (error.response?.status === 429 && retries > 0) {
         const backoffDelay = Math.min(1000 * Math.pow(2, 3 - retries), 10000); // Max 10s
-        this.logger.warn(`HyperLiquid rate limited, retrying in ${backoffDelay}ms (${retries} retries left)`);
+        // Silenced 429 warnings - only show errors
+        this.logger.debug(`HyperLiquid rate limited, retrying in ${backoffDelay}ms (${retries} retries left)`);
         await new Promise(resolve => setTimeout(resolve, backoffDelay));
         return this.fetchMetaAndAssetCtxs(retries - 1);
       }

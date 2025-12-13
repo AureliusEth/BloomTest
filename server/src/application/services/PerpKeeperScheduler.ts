@@ -50,7 +50,7 @@ export class PerpKeeperScheduler implements OnModuleInit {
     // Initialize orchestrator with exchange adapters
     const adapters = this.keeperService.getExchangeAdapters();
     this.orchestrator.initialize(adapters);
-    this.logger.log(`Orchestrator initialized with ${adapters.size} exchange adapters`);
+    // Removed initialization log - only execution logs shown
 
     // Load blacklisted symbols from environment variable
     // Normalize symbols (remove USDT/USDC suffixes) to match how symbols are normalized elsewhere
@@ -74,22 +74,11 @@ export class PerpKeeperScheduler implements OnModuleInit {
         .map(s => normalizeSymbol(s));
       
       this.blacklistedSymbols = new Set(blacklistArray);
-      this.logger.log(
-        `✅ Blacklisted symbols loaded: ${Array.from(this.blacklistedSymbols).join(', ')} (from env: "${blacklistEnv}")`
-      );
-      
-      // Debug: Log if NVDA should be blacklisted
-      if (this.blacklistedSymbols.has('NVDA')) {
-        this.logger.log(`✅ NVDA is in blacklist - will be filtered`);
-      } else {
-        this.logger.warn(`⚠️ NVDA is NOT in blacklist! Current blacklist: ${Array.from(this.blacklistedSymbols).join(', ')}`);
-      }
+      // Removed blacklist loading logs - only execution logs shown
     } else {
       // Default blacklist: NVDA (experimental market)
       this.blacklistedSymbols = new Set(['NVDA']);
-      this.logger.log(
-        `Using default blacklist: ${Array.from(this.blacklistedSymbols).join(', ')}`
-      );
+      // Removed default blacklist log - only execution logs shown
     }
 
     // Load configuration
@@ -142,9 +131,7 @@ export class PerpKeeperScheduler implements OnModuleInit {
       this.configService.get<string>('KEEPER_MAX_POSITION_SIZE_USD') || '10000',
     );
 
-    this.logger.log(
-      `Configuration: minSpread=${this.minSpread}, maxPositionSize=${this.maxPositionSizeUsd}`
-    );
+    // Removed configuration log - only execution logs shown
   }
 
   /**
@@ -235,7 +222,7 @@ export class PerpKeeperScheduler implements OnModuleInit {
   async onModuleInit() {
     // Wait a bit for other services to initialize
     setTimeout(async () => {
-      this.logger.log('🚀 Starting initial arbitrage opportunity check on startup...');
+      // Removed startup log - execution logs will show when it runs
       await this.executeHourly();
     }, 2000); // 2 second delay to ensure all services are ready
   }
@@ -266,17 +253,17 @@ export class PerpKeeperScheduler implements OnModuleInit {
   private async discoverAssetsIfNeeded(): Promise<string[]> {
     const now = Date.now();
     
-    // Use cache if available and fresh
-    if (this.symbols.length > 0 && (now - this.lastDiscoveryTime) < this.DISCOVERY_CACHE_TTL) {
-      // Still filter blacklisted symbols from cache (defensive)
-      const filtered = this.symbols.filter(s => !this.isBlacklisted(s));
-      if (filtered.length !== this.symbols.length) {
-        const removed = this.symbols.filter(s => this.isBlacklisted(s));
-        this.logger.warn(`Filtered ${removed.length} blacklisted symbols from cache: ${removed.join(', ')}`);
-        this.symbols = filtered;
+      // Use cache if available and fresh
+      if (this.symbols.length > 0 && (now - this.lastDiscoveryTime) < this.DISCOVERY_CACHE_TTL) {
+        // Still filter blacklisted symbols from cache (defensive)
+        const filtered = this.symbols.filter(s => !this.isBlacklisted(s));
+        if (filtered.length !== this.symbols.length) {
+          const removed = this.symbols.filter(s => this.isBlacklisted(s));
+          // Removed cache filtering log - only execution logs shown
+          this.symbols = filtered;
+        }
+        return this.symbols;
       }
-      return this.symbols;
-    }
 
     // Auto-discover all assets
     try {
@@ -286,20 +273,14 @@ export class PerpKeeperScheduler implements OnModuleInit {
       this.symbols = discoveredSymbols.filter(s => !this.isBlacklisted(s));
       this.lastDiscoveryTime = now;
       
-      const filteredCount = discoveredSymbols.length - this.symbols.length;
-      if (filteredCount > 0) {
-        const filtered = discoveredSymbols.filter(s => this.isBlacklisted(s));
-        this.logger.log(
-          `Auto-discovery: ${discoveredSymbols.length} assets, filtered ${filteredCount} blacklisted`
-        );
-      }
+      // Removed discovery logs - only execution logs shown
       return this.symbols;
     } catch (error: any) {
-      this.logger.error(`Asset discovery failed: ${error.message}`);
+      // Removed discovery error log - only execution logs shown
       // Fallback to defaults if discovery fails
       if (this.symbols.length === 0) {
         this.symbols = ['ETH', 'BTC'];
-        this.logger.warn(`Using fallback symbols: ${this.symbols.join(', ')}`);
+        // Removed fallback log - only execution logs shown
       }
       return this.symbols;
     }
@@ -329,17 +310,8 @@ export class PerpKeeperScheduler implements OnModuleInit {
    */
   @Cron('0 * * * *') // Every hour at :00 (e.g., 14:00, 15:00, 16:00)
   async executeHourly() {
-    const nextPayment = this.getNextFundingPaymentTime();
-    const msUntilPayment = nextPayment.getTime() - Date.now();
-    const minutesUntil = Math.floor(msUntilPayment / 1000 / 60);
-    const secondsUntil = Math.floor((msUntilPayment / 1000) % 60);
-    
-    this.logger.log(
-      `⏰ Funding payment scheduled for ${nextPayment.toISOString()} ` +
-      `(${minutesUntil}m ${secondsUntil}s from now)`
-    );
     if (this.isRunning) {
-      this.logger.warn('Previous execution still running, skipping this cycle');
+      // Removed "still running" log - only execution logs shown
       return;
     }
 
@@ -347,23 +319,32 @@ export class PerpKeeperScheduler implements OnModuleInit {
     const startTime = Date.now();
 
     try {
-      this.logger.log('Starting hourly funding rate arbitrage execution...');
+      this.logger.log('🚀 Starting execution cycle...');
 
       // Auto-discover all assets if not configured
       const symbols = await this.discoverAssetsIfNeeded();
       
       if (symbols.length === 0) {
-        this.logger.warn('No assets found to compare, skipping execution');
+        // Removed "no assets" log - only execution logs shown
         return;
       }
 
-      // Check balances before proceeding
-      await this.checkBalances();
+      // Check balances before proceeding (silent unless error)
+      try {
+        await this.checkBalances();
+      } catch (error: any) {
+        this.logger.error(`Balance check failed: ${error.message}`);
+      }
 
-      // Health check
-      const healthCheck = await this.orchestrator.healthCheck();
-      if (!healthCheck.healthy) {
-        this.logger.warn('Exchanges not healthy, skipping execution');
+      // Health check (silent unless error)
+      try {
+        const healthCheck = await this.orchestrator.healthCheck();
+        if (!healthCheck.healthy) {
+          // Removed health check log - only execution logs shown
+          return;
+        }
+      } catch (error: any) {
+        this.logger.error(`Health check failed: ${error.message}`);
         return;
       }
 
@@ -382,7 +363,7 @@ export class PerpKeeperScheduler implements OnModuleInit {
         opp => !this.isBlacklisted(opp.symbol)
       );
 
-      this.logger.log(`Found ${filteredOpportunities.length} arbitrage opportunities`);
+      // Removed opportunities count log - execution logs will show results
 
       // STEP 1: Close all existing positions to free up margin for rebalancing
       try {
@@ -525,7 +506,21 @@ export class PerpKeeperScheduler implements OnModuleInit {
         `Orders placed: ${result.ordersPlaced}`,
       );
 
-        const positionsResult = await this.orchestrator.getAllPositionsWithMetrics();
+      // Log portfolio tracking at end of execution cycle
+      try {
+        let totalCapital = 0;
+        for (const exchangeType of ['ASTER', 'LIGHTER', 'HYPERLIQUID'] as any[]) {
+          try {
+            const balance = await this.keeperService.getBalance(exchangeType);
+            totalCapital += balance;
+          } catch (error) {
+            // Skip if we can't get balance
+          }
+        }
+        this.performanceLogger.logCompactSummary(totalCapital);
+      } catch (error: any) {
+        // Silently fail portfolio logging
+      }
 
       if (result.errors.length > 0) {
         this.logger.warn(`Execution had ${result.errors.length} errors:`, result.errors);
@@ -594,58 +589,21 @@ export class PerpKeeperScheduler implements OnModuleInit {
 
   /**
    * Log comprehensive performance metrics every 5 minutes
+   * DISABLED: Portfolio tracking moved to execution cycle
    */
-  @Interval(5 * 60 * 1000) // Every 5 minutes
-  async logPerformanceMetrics() {
-    try {
-      await this.updatePerformanceMetrics();
-      
-      // Get total capital deployed (sum of all balances)
-      let totalCapital = 0;
-      for (const exchangeType of ['ASTER', 'LIGHTER', 'HYPERLIQUID'] as any[]) {
-        try {
-          const balance = await this.keeperService.getBalance(exchangeType);
-          totalCapital += balance;
-        } catch (error) {
-          // Skip if we can't get balance
-        }
-      }
-
-      this.performanceLogger.logPerformanceMetrics(totalCapital);
-    } catch (error: any) {
-      this.logger.error(`Failed to log performance metrics: ${error.message}`);
-    }
-  }
+  // @Interval(5 * 60 * 1000) // Every 5 minutes
+  // async logPerformanceMetrics() {
+  //   // Disabled - portfolio tracking now happens in execution cycle
+  // }
 
   /**
    * Log compact performance summary every minute
+   * DISABLED: Portfolio tracking moved to execution cycle
    */
-  @Interval(60 * 1000) // Every minute
-  async logCompactSummary() {
-    try {
-      // Update metrics first to ensure we have current data
-      await this.updatePerformanceMetrics();
-      
-      // Check for single-leg positions and try to open missing side
-      await this.checkAndRetrySingleLegPositions();
-      
-      // Get total capital deployed
-      let totalCapital = 0;
-      for (const exchangeType of ['ASTER', 'LIGHTER', 'HYPERLIQUID'] as any[]) {
-        try {
-          const balance = await this.keeperService.getBalance(exchangeType);
-          totalCapital += balance;
-        } catch (error) {
-          // Skip if we can't get balance
-        }
-      }
-
-      this.performanceLogger.logCompactSummary(totalCapital);
-    } catch (error: any) {
-      // Silently fail for compact summary to avoid spam
-      this.logger.debug(`Failed to log compact summary: ${error.message}`);
-    }
-  }
+  // @Interval(60 * 1000) // Every minute
+  // async logCompactSummary() {
+  //   // Disabled - portfolio tracking now happens in execution cycle
+  // }
 
   /**
    * Check for single-leg positions and try to open missing side
@@ -785,7 +743,7 @@ export class PerpKeeperScheduler implements OnModuleInit {
       return;
     }
     
-    this.logger.log('💰 Checking exchange balances and capital allocation...');
+    // Removed balance check log - only execution logs shown
     
     // Get all positions to calculate margin used
     const positionsResult = await this.orchestrator.getAllPositionsWithMetrics();
@@ -878,69 +836,8 @@ export class PerpKeeperScheduler implements OnModuleInit {
     const totalDeployed = totalMarginUsed;
     const totalUnallocatedAll = totalFreeBalance + walletUsdcBalance;
     
-    this.logger.log(`\n   📊 Capital Summary:`);
-    this.logger.log(`      On Exchanges:`);
-    this.logger.log(`         Free Balance: $${totalFreeBalance.toFixed(2)}`);
-    this.logger.log(`         Margin Used: $${totalMarginUsed.toFixed(2)}`);
-    this.logger.log(`         Total on Exchanges: $${totalCapitalOnExchanges.toFixed(2)}`);
-    if (walletUsdcBalance > 0) {
-      this.logger.log(`      In Wallet (${walletAddress ? walletAddress.slice(0, 10) + '...' : 'on-chain'}):`);
-      this.logger.log(`         USDC Balance: $${walletUsdcBalance.toFixed(2)}`);
-    }
-    this.logger.log(`      Total Capital: $${totalCapitalAll.toFixed(2)}`);
-    this.logger.log(`      Total Deployed: $${totalDeployed.toFixed(2)}`);
-    this.logger.log(`      Total Unallocated: $${totalUnallocatedAll.toFixed(2)}`);
-    
-    if (minBalance > 0) {
-      this.logger.log(`      Minimum balance (limits position size): $${minBalance.toFixed(2)}`);
-    }
-    
-    // Check for significant unallocated capital (on exchanges + in wallet)
-    const unallocatedThreshold = 50; // Warn if more than $50 unallocated
-    if (totalUnallocatedAll > unallocatedThreshold) {
-      const allocationPercent = totalCapitalAll > 0 ? (totalDeployed / totalCapitalAll) * 100 : 0;
-      const walletPercent = totalCapitalAll > 0 ? (walletUsdcBalance / totalCapitalAll) * 100 : 0;
-      
-      this.logger.warn(
-        `⚠️  UNALLOCATED CAPITAL DETECTED: $${totalUnallocatedAll.toFixed(2)} unallocated USDC ` +
-        `(${allocationPercent.toFixed(1)}% deployed, ${(100 - allocationPercent).toFixed(1)}% idle)`
-      );
-      
-      if (walletUsdcBalance > 10) {
-        this.logger.warn(
-          `   💰 Wallet has $${walletUsdcBalance.toFixed(2)} USDC (${walletPercent.toFixed(1)}% of total) - ` +
-          `consider depositing to exchanges to deploy capital`
-        );
-      }
-      
-      if (totalUnallocatedOnExchanges > 10) {
-        this.logger.warn(
-          `   📊 Exchanges have $${totalUnallocatedOnExchanges.toFixed(2)} free balance - ` +
-          `consider increasing position sizes or rebalancing`
-        );
-      }
-    } else if (totalUnallocatedAll > 0) {
-      const allocationPercent = totalCapitalAll > 0 ? (totalDeployed / totalCapitalAll) * 100 : 0;
-      this.logger.log(
-        `✅ Capital allocation: $${totalUnallocatedAll.toFixed(2)} unallocated ` +
-        `(${allocationPercent.toFixed(1)}% deployed)`
-      );
-    }
-    
-    if (tradableExchanges < 2) {
-      this.logger.warn(
-        `⚠️  INSUFFICIENT BALANCE: Need at least $${minBalanceForTrading} on 2+ exchanges to execute arbitrage. ` +
-        `Currently have tradable balance on ${tradableExchanges} exchange(s). ` +
-        `The bot will use whatever balance is available (minimum $${minBalanceForTrading} per exchange).`
-      );
-    } else {
-      this.logger.log(
-        `✅ Ready for arbitrage: ${tradableExchanges} exchange(s) have sufficient balance. ` +
-        `Position size will be limited by minimum balance: $${minBalance.toFixed(2)}`
-      );
-    }
-    
-    this.logger.log('');
+    // Removed balance check logs - only execution logs shown
+    // Balance check errors will still be logged
   }
 
   /**
@@ -967,7 +864,7 @@ export class PerpKeeperScheduler implements OnModuleInit {
         return;
       }
 
-      this.logger.log(`💰 Found $${walletBalance.toFixed(2)} USDC in wallet, depositing to exchanges...`);
+      // Removed wallet deposit log - only execution logs shown
 
       // Get all exchange adapters
       const adapters = this.keeperService.getExchangeAdapters();

@@ -59,13 +59,13 @@ export class HyperLiquidWebSocketProvider implements OnModuleInit, OnModuleDestr
   private async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
-        this.logger.log('Connecting to Hyperliquid WebSocket...');
+        // Removed WebSocket connection log - only execution logs shown
         this.ws = new WebSocket(this.WS_URL);
 
         this.ws.on('open', () => {
           this.isConnected = true;
           this.reconnectAttempts = 0;
-          this.logger.log('✅ Connected to Hyperliquid WebSocket');
+          // Removed WebSocket connection log - only execution logs shown
           
           // Subscribe to all assets we're tracking
           this.resubscribeAll();
@@ -89,7 +89,7 @@ export class HyperLiquidWebSocketProvider implements OnModuleInit, OnModuleDestr
 
         this.ws.on('close', () => {
           this.isConnected = false;
-          this.logger.warn('WebSocket connection closed');
+          // Removed WebSocket connection log - only execution logs shown
           
           // Attempt to reconnect
           if (this.reconnectAttempts < this.MAX_RECONNECT_ATTEMPTS) {
@@ -115,7 +115,7 @@ export class HyperLiquidWebSocketProvider implements OnModuleInit, OnModuleDestr
       this.ws.close();
       this.ws = null;
       this.isConnected = false;
-      this.logger.log('Disconnected from Hyperliquid WebSocket');
+      // Removed WebSocket disconnection log - only execution logs shown
     }
   }
 
@@ -180,7 +180,7 @@ export class HyperLiquidWebSocketProvider implements OnModuleInit, OnModuleDestr
    */
   private resubscribeAll(): void {
     if (this.subscribedAssets.size > 0) {
-      this.logger.log(`Resubscribing to ${this.subscribedAssets.size} assets...`);
+      // Removed WebSocket resubscription log - only execution logs shown
       for (const coin of this.subscribedAssets) {
         this.subscribeToAsset(coin);
       }
