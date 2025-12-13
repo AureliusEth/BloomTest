@@ -52,7 +52,7 @@ export class ExtendedFundingDataProvider {
         this.logger.debug(`Cached ${this.symbolToMarketIdCache.size} market IDs from Extended API`);
       }
     } catch (error: any) {
-      this.logger.warn(`Failed to refresh symbol cache: ${error.message}`);
+      this.logger.debug(`Failed to refresh symbol cache: ${error.message}`);
     }
   }
 
@@ -89,7 +89,7 @@ export class ExtendedFundingDataProvider {
       return fundingRate;
     } catch (error: any) {
       const errorMsg = error.response?.data?.message || error.message || String(error);
-      this.logger.error(`Failed to get funding rate for ${symbol}: ${errorMsg}`);
+      this.logger.debug(`Failed to get funding rate for ${symbol}: ${errorMsg}`);
       throw new Error(`Failed to get Extended funding rate: ${errorMsg}`);
     }
   }
@@ -171,7 +171,7 @@ export class ExtendedFundingDataProvider {
       throw new Error(`Open interest not found in response: ${JSON.stringify(response.data)}`);
     } catch (error: any) {
       const errorMsg = error.response?.data?.message || error.message || String(error);
-      this.logger.error(`Failed to get open interest for ${symbol}: ${errorMsg}`);
+      this.logger.debug(`Failed to get open interest for ${symbol}: ${errorMsg}`);
       throw new Error(`Failed to get Extended open interest: ${errorMsg}`);
     }
   }
@@ -195,7 +195,7 @@ export class ExtendedFundingDataProvider {
       return markPrice;
     } catch (error: any) {
       const errorMsg = error.response?.data?.message || error.message || String(error);
-      this.logger.error(`Failed to get mark price for ${symbol}: ${errorMsg}`);
+      this.logger.debug(`Failed to get mark price for ${symbol}: ${errorMsg}`);
       throw new Error(`Failed to get Extended mark price: ${errorMsg}`);
     }
   }

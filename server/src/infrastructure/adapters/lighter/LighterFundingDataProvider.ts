@@ -108,7 +108,7 @@ export class LighterFundingDataProvider implements OnModuleInit {
     }
     
     // If not in cache, return 0 (market might not exist or have no funding rate)
-    this.logger.warn(`Lighter funding rate for market ${marketIndex} not found in cache`);
+    this.logger.debug(`Lighter funding rate for market ${marketIndex} not found in cache`);
     return 0;
   }
 
@@ -198,7 +198,7 @@ export class LighterFundingDataProvider implements OnModuleInit {
       
       if (isNaN(markPrice) || markPrice <= 0) {
         const errorMsg = `Invalid mark price: "${markPriceRaw}" parsed to ${markPrice} (must be > 0)`;
-        this.logger.error(`  ❌ ERROR: ${errorMsg}`);
+        this.logger.debug(`  ❌ ERROR: ${errorMsg}`);
         throw new Error(`Lighter OI API error for market ${marketIndex}: ${errorMsg}`);
       }
       
@@ -299,7 +299,7 @@ export class LighterFundingDataProvider implements OnModuleInit {
       
       if (isNaN(markPrice) || markPrice <= 0) {
         const errorMsg = `Invalid mark price: "${markPriceRaw}" parsed to ${markPrice} (must be > 0)`;
-        this.logger.error(`  ❌ ERROR: ${errorMsg}`);
+        this.logger.debug(`  ❌ ERROR: ${errorMsg}`);
         throw new Error(`Lighter API error for market ${marketIndex}: ${errorMsg}`);
       }
       

@@ -317,17 +317,17 @@ export class FundingRateAggregator {
         } catch (dataError: any) {
           // Log the error with full context
           const errorMsg = dataError.message || String(dataError);
-          this.logger.error(`Failed to get Lighter data for ${symbol} (market ${marketIndex}): ${errorMsg}`);
+          this.logger.debug(`Failed to get Lighter data for ${symbol} (market ${marketIndex}): ${errorMsg}`);
           
           // If it's an OI error, we can't proceed - OI is required for liquidity checks
           if (errorMsg.includes('OI') || errorMsg.includes('open interest') || errorMsg.includes('openInterest')) {
-            this.logger.error(`  ⚠️  Skipping Lighter for ${symbol} - OI is required but unavailable`);
+            this.logger.debug(`  ⚠️  Skipping Lighter for ${symbol} - OI is required but unavailable`);
             // Don't add rate entry if OI is unavailable - it will show as N/A
           } else {
             // For other errors (mark price, predicted rate), we can still add with defaults
           // Only add if funding rate is non-zero (indicates active market)
           if (lighterRate !== 0) {
-              this.logger.warn(`  ⚠️  Adding Lighter rate for ${symbol} with default values (mark price/OI unavailable)`);
+              this.logger.debug(`  ⚠️  Adding Lighter rate for ${symbol} with default values (mark price/OI unavailable)`);
             rates.push({
               exchange: ExchangeType.LIGHTER,
               symbol,
